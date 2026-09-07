@@ -1810,15 +1810,83 @@ class CommandHandler:
         }
 
     def delete_all(self):
+        """Clear the active design: unwind the timeline, then sweep leftovers.
+
+        Returns counts of what was removed plus any per-item failures.  Raises
+        if the design is *not* empty afterwards — a caller that believes this
+        succeeded will happily build on a dirty document.
+        """
         design = self._design()
-        if hasattr(design, "timeline") and design.timeline.count > 0:
-            tl = design.timeline
+        root = design.rootComponent
+        deleted = {"timeline": 0, "bodies": 0, "sketches": 0}
+        errors = []
+
+        # Parametric: unwind newest-first.  NOTE: TimelineObject has no
+        # deleteMe() — that method lives on the *entity* it wraps.  Calling it
+        # on the TimelineObject raises AttributeError on every item.
+        tl = getattr(design, "timeline", None)
+        if tl is not None and tl.count > 0:
             for i in range(tl.count - 1, -1, -1):
+                name = "?"
                 try:
-                    tl.item(i).deleteMe()
-                except Exception:
-                    pass
-        return {"deleted": True}
+                    item = tl.item(i)
+                    name = item.name
+                    entity = item.entity
+                    if entity is None:
+                        errors.append(
+                            {"stage": "timeline", "index": i, "name": name,
+                             "error": "timeline item exposes no entity"}
+                        )
+                        continue
+                    entity.deleteMe()
+                    deleted["timeline"] += 1
+                except Exception as exc:
+                    errors.append(
+                        {"stage": "timeline", "index": i, "name": name,
+                         "error": f"{type(exc).__name__}: {exc}"}
+                    )
+
+        # Direct mode has no timeline; also catches anything the pass above
+        # could not remove.
+        for i in range(root.bRepBodies.count - 1, -1, -1):
+            name = "?"
+            try:
+                body = root.bRepBodies.item(i)
+                name = body.name
+                body.deleteMe()
+                deleted["bodies"] += 1
+            except Exception as exc:
+                errors.append(
+                    {"stage": "body", "index": i, "name": name,
+                     "error": f"{type(exc).__name__}: {exc}"}
+                )
+
+        for i in range(root.sketches.count - 1, -1, -1):
+            name = "?"
+            try:
+                sk = root.sketches.item(i)
+                name = sk.name
+                sk.deleteMe()
+                deleted["sketches"] += 1
+            except Exception as exc:
+                errors.append(
+                    {"stage": "sketch", "index": i, "name": name,
+                     "error": f"{type(exc).__name__}: {exc}"}
+                )
+
+        remaining = {
+            "bodies": root.bRepBodies.count,
+            "sketches": root.sketches.count,
+            "timeline": tl.count if tl is not None else 0,
+        }
+
+        if remaining["bodies"] or remaining["sketches"]:
+            raise RuntimeError(
+                f"delete_all did not clear the design — remaining: {remaining}. "
+                f"Deleted: {deleted}. Failures: {errors}"
+            )
+
+        return {"deleted": deleted, "remaining": remaining, "errors": errors}
 
     def undo(self):
         design = self._design()
@@ -2962,9 +3030,16 @@ class CommandHandler:
         output = buf.getvalue()
         result = last_expr_value if last_expr_value is not None else output
 
-        # Warn if design type changed during execution
-        type_after = design.designType
+        # Warn if design type changed during execution.  The design captured
+        # at entry can be dead by now — code is allowed to close or switch
+        # documents — and touching a stale handle raises "API Object refers to
+        # a deleted Object".  A dead handle is not an execution failure.
         design_type_warning = None
+        try:
+            type_after = design.designType
+        except RuntimeError as exc:
+            type_after = type_before
+            log.debug("design handle stale after execute_code: %s", exc)
         if type_before != type_after:
             design_type_warning = (
                 f"WARNING: Design type changed from "
