@@ -2306,6 +2306,16 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "section": {
+                    "type": "object",
+                    "description": (
+                        "Cut the model open for the capture with a temporary "
+                        "section analysis: {plane: xy|xz|yz, offset_mm: number, "
+                        "flip: bool}. Shows pocket floors, grooves and wall "
+                        "thickness that an exterior view hides. Removed "
+                        "afterwards; the timeline is untouched."
+                    ),
+                },
                 "views": {
                     "type": "array",
                     "items": {
@@ -2490,7 +2500,22 @@ TOOLS: list[dict] = [
             "Build scripts are expected to be idempotent: wipe first, then "
             "rebuild from zero, so running twice gives an identical result. "
             "On failure the script's own traceback and everything it printed "
-            "before dying are returned verbatim."
+            "before dying are returned verbatim.\n\n"
+            "document: name of the design's own document. The rebuild finds "
+            "the open document tagged with that name (or creates one) and "
+            "activates it, so designs never share a document and never land "
+            "in whatever tab was last clicked. fresh=true closes and recreates "
+            "it first — Fusion keeps undo history for every rebuild and a "
+            "document rebuilt all day gets 2-4x slower.\n\n"
+            "The result is a full report so one call is one iteration: "
+            "verify.bodies (name, volume_mm3, bbox_mm) and "
+            "verify.timeline_problems; contract (every fusionlib check()/"
+            "expect() the script declared, with the build FAILING as "
+            "CONTRACT_FAILED if any did not hold); and trace, the total volume "
+            "after each fusionlib feature with delta_mm3 per step and, when "
+            "the same script was built before, delta_vs_previous_build_mm3 — "
+            "trace_changed_steps lists the features whose contribution moved. "
+            "Read those before reaching for fusion_inspect or a screenshot."
         ),
         "inputSchema": {
             "type": "object",
@@ -2503,6 +2528,27 @@ TOOLS: list[dict] = [
                 "args": {
                     "type": "object",
                     "description": "Passed to the script as 'args' / build(**args)",
+                },
+                "document": {
+                    "type": "string",
+                    "description": (
+                        "Design name; build in the document tagged with it, "
+                        "creating one if needed (default: the active document)"
+                    ),
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": (
+                        "With document: close and recreate the document first "
+                        "(default false)"
+                    ),
+                },
+                "verify": {
+                    "type": "boolean",
+                    "description": (
+                        "Include verify.bodies and verify.timeline_problems "
+                        "(default true)"
+                    ),
                 },
             },
         },
@@ -2626,6 +2672,26 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "wall_check": {
+                    "type": "boolean",
+                    "description": (
+                        "Measure the thinnest wall by ray casting from each "
+                        "planar face (default true). A wall under two nozzle "
+                        "widths is reported as a warning: the slicer thins or "
+                        "drops it and nothing in the model says so."
+                    ),
+                },
+                "nozzle_mm": {
+                    "type": "number",
+                    "description": "Nozzle diameter for the wall check (default 0.4)",
+                },
+                "orientation": {
+                    "type": "boolean",
+                    "description": (
+                        "Report overhang area for each of the six axis-aligned "
+                        "print orientations and name the best (default true)."
+                    ),
+                },
                 "overhang_deg": {"type": "number",
                                  "description": "Overhang threshold, degrees"},
                 "min_feature_mm": {"type": "number",
@@ -2674,6 +2740,18 @@ TOOLS: list[dict] = [
             "type": "object",
             "required": ["joint_name"],
             "properties": {
+                "clearance_pairs": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "string"}},
+                    "description": (
+                        "Body-name pairs, e.g. [[\"Carriage_Body\", "
+                        "\"Left_Rail\"]]. At every step the minimum distance "
+                        "between each pair is measured (mm); min_clearance in "
+                        "the result names the tightest pair and step. Interference "
+                        "says whether parts overlap; this says how much air a "
+                        "sliding fit actually has through its travel."
+                    ),
+                },
                 "joint_name": {"type": "string"},
                 "start": {"type": "number"},
                 "stop": {"type": "number"},

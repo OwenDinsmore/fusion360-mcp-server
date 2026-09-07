@@ -27,6 +27,62 @@ from . import hints as _hints
 log = get_logger("handler")
 
 
+
+def _repair_adsk_package():
+    """Make ``import adsk.fusion`` inside an agent script mean what it says.
+
+    Seen in the wild: ``sys.modules["adsk"]`` was a fresh, empty package
+    object while ``adsk.core`` / ``adsk.fusion`` in sys.modules were the
+    originals.  ``import adsk.fusion`` in a script then binds the bare package
+    and raises "module 'adsk' has no attribute 'fusion'" on first use, even
+    though the handler's own ``adsk`` is fine.  Re-attach the submodules so
+    both routes to the API agree, and say so in the log — the trigger has not
+    been identified, and the log is how it will be.
+    """
+    global adsk
+    # The genuine package carries what Fusion injects at startup
+    # (``adsk.doEvents`` among others).  A replacement built by a later
+    # ``import adsk.x`` has none of that.  This module can itself be reloaded
+    # and pick up an impostor, so the reference of record is the add-in's
+    # main module, which is never reloaded while the add-in runs.
+    original = adsk if hasattr(adsk, "doEvents") else None
+    if original is None:
+        for holder in ("Fusion360MCP.Fusion360MCP", "Fusion360MCP"):
+            cand = getattr(sys.modules.get(holder), "adsk", None)
+            if hasattr(cand, "doEvents"):
+                original = cand
+                break
+    if original is None:
+        for mod in list(sys.modules.values()):
+            cand = getattr(mod, "adsk", None)
+            if hasattr(cand, "doEvents"):
+                original = cand
+                break
+    if original is None:
+        log.error("no module holds the genuine adsk package; restart the add-in")
+        original = adsk
+    if original is not adsk:
+        adsk = original
+    pkg = sys.modules.get("adsk")
+    if pkg is not original:
+        sys.modules["adsk"] = original
+        log.warning("sys.modules['adsk'] was %s; restored the genuine package",
+                    "missing" if pkg is None else "a different object")
+        pkg = original
+    repaired = []
+    for sub in ("core", "fusion", "cam"):
+        mod = sys.modules.get(f"adsk.{sub}")
+        if mod is not None and getattr(pkg, sub, None) is not mod:
+            setattr(pkg, sub, mod)
+            repaired.append(sub)
+        if getattr(adsk, sub, None) is None and mod is not None:
+            setattr(adsk, sub, mod)
+    if repaired:
+        log.warning("adsk package lost submodule attribute(s) %s; re-attached "
+                    "(package object %s handler's)", repaired,
+                    "is" if pkg is adsk else "is NOT")
+    return repaired
+
 class CommandHandler:
     """Runs Fusion API operations.  Instantiated once; reused across requests."""
 
@@ -2404,14 +2460,10 @@ class CommandHandler:
         }
 
     def create_section_analysis(self, plane: str = "yz", offset: float = 0):
-        root = self._root()
-        analyses = root.analyses
-
-        inp = analyses.createInput()
-        inp.plane = self._construction_plane(plane)
-        if offset != 0:
-            inp.distance = adsk.core.ValueInput.createByReal(offset)
-
+        # Component has no `analyses`; section analyses live on the Design.
+        analyses = self._design().analyses.sectionAnalyses
+        inp = analyses.createInput(
+            self._construction_plane(plane), float(offset))
         analyses.add(inp)
         return {"created": True, "plane": plane, "offset": offset}
 
@@ -3018,6 +3070,7 @@ class CommandHandler:
     # ------------------------------------------------------------------
 
     def execute_code(self, code: str):
+        _repair_adsk_package()
         design = self._design()
         type_before = design.designType
 
@@ -3378,10 +3431,44 @@ class CommandHandler:
         width: int = 1024,
         height: int = 768,
         fit: bool = True,
+        section=None,
     ):
-        """Capture several named views in one call.  See the tool docstring."""
+        """Capture several named views in one call.  See the tool docstring.
+
+        section: {"plane": "xy"|"xz"|"yz", "offset_mm": float, "flip": bool}
+        cuts the model open with a temporary section analysis for the
+        duration of the capture, so a pocket floor or a groove can be seen
+        and measured against its neighbours.  The analysis is deleted
+        afterwards; the timeline is untouched.
+        """
         if views is None:
             views = ["iso"]
+        analysis = None
+        if section:
+            plane = str(section.get("plane", "xz")).lower()
+            offset_mm = float(section.get("offset_mm", 0.0))
+            # Section analyses hang off Design.analyses.sectionAnalyses on
+            # this build; Component has no `analyses` at all.
+            analyses = self._design().analyses.sectionAnalyses
+            # createInput's distance is a bare double in INTERNAL units (cm),
+            # not a ValueInput — one of the few places in the API that is.
+            inp = analyses.createInput(
+                self._construction_plane(plane), self._cm(offset_mm))
+            if section.get("flip") and hasattr(inp, "isFlipped"):
+                inp.isFlipped = True
+            analysis = analyses.add(inp)
+        try:
+            return self._fusion_screenshot(views, shaded, width, height, fit,
+                                           section=section)
+        finally:
+            if analysis is not None:
+                try:
+                    analysis.deleteMe()
+                except Exception as exc:
+                    log.warning("section analysis not removed: %s", exc)
+
+    def _fusion_screenshot(self, views, shaded, width, height, fit,
+                           section=None):
         if isinstance(views, str):
             views = [views]
         if not views:
@@ -3488,6 +3575,7 @@ class CommandHandler:
             "count": len(images),
             "views": [i["view"] for i in images],
             "shaded": bool(shaded),
+            "section": section or None,
             "total_bytes": sum(i["bytes"] for i in images),
             "images": images,
         }
@@ -3882,7 +3970,84 @@ class CommandHandler:
 
     # ── fusion_rebuild ─────────────────────────────────────────────────
 
-    def fusion_rebuild(self, script_path: str, args=None):
+    # Attribute that names the design a document belongs to.  A rebuild with
+    # document="module_28" finds (or creates) the document carrying it, so two
+    # designs never share a document and a build never lands in whatever tab
+    # the user last clicked.
+    _DESIGN_ATTR = ("mcp_fusion", "design")
+
+    def _find_owned_document(self, tag: str):
+        docs = self.app.documents
+        for i in range(docs.count):
+            doc = docs.item(i)
+            try:
+                prod = doc.products.itemByProductType("DesignProductType")
+                if prod is None:
+                    continue
+                d = adsk.fusion.Design.cast(prod)
+                a = d.rootComponent.attributes.itemByName(*self._DESIGN_ATTR)
+                if a is not None and a.value == tag:
+                    return doc
+            except Exception:
+                continue
+        return None
+
+    def _owned_document(self, tag: str, fresh: bool):
+        """Return (document, info) for design *tag*, creating or recycling it.
+
+        fresh=True closes the existing document without saving and starts a
+        new one.  Measured: the same carriage rebuilt in 1.7 s in a fresh
+        document and 3.6–7.9 s in one that had been rebuilt all day, and the
+        rack build 3.9 s against 13.9 s — Fusion keeps undo history for every
+        rebuild, and the document slows down as it grows.
+        """
+        doc = self._find_owned_document(tag)
+        created = recycled = False
+        if doc is not None and fresh:
+            doc.close(False)
+            doc, recycled = None, True
+        if doc is None:
+            doc = self.app.documents.add(
+                adsk.core.DocumentTypes.FusionDesignDocumentType)
+            created = True
+            d = adsk.fusion.Design.cast(
+                doc.products.itemByProductType("DesignProductType"))
+            attrs = d.rootComponent.attributes
+            attrs.add(*self._DESIGN_ATTR, tag)
+            attrs.add(self._MCP_ATTR_GROUP, "owned_by",
+                      f"fusion_rebuild@{time.strftime('%Y-%m-%dT%H:%M:%S')}")
+        doc.activate()
+        return doc, {"tag": tag, "name": doc.name, "created": created,
+                     "recycled": recycled}
+
+    def _timeline_problems(self, design) -> list:
+        """Errored or warned timeline features, as fusion_inspect reports them."""
+        problems = []
+        tl = getattr(design, "timeline", None)
+        if tl is None:
+            return problems
+        healthy = adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState
+        suppressed = adsk.fusion.FeatureHealthStates.SuppressedFeatureHealthState
+        warning = adsk.fusion.FeatureHealthStates.WarningFeatureHealthState
+        for i in range(tl.count):
+            item = tl.item(i)
+            try:
+                state = item.healthState
+            except Exception:
+                continue
+            if state in (healthy, suppressed):
+                continue
+            problems.append({
+                "index": i, "name": item.name,
+                "severity": "warning" if state == warning else "error",
+                "message": item.errorOrWarningMessage or "",
+            })
+        return problems
+
+    _last_trace: dict = {}
+
+    def fusion_rebuild(self, script_path: str, args=None, document: str = None,
+                       fresh: bool = False, verify: bool = True):
         """Run a build script from disk as one call.  See the tool docstring."""
         path = os.path.abspath(os.path.expanduser(script_path))
         if not os.path.exists(path):
@@ -3896,6 +4061,29 @@ class CommandHandler:
         with open(path, "r", encoding="utf-8") as fh:
             source = fh.read()
 
+        _repair_adsk_package()
+
+        # Static checks first: the footguns in CLAUDE.md, caught before the
+        # script touches the model.  Reported, not enforced — design_gate.py
+        # is the place that refuses on E-rules.
+        lint = None
+        for root_dir in (os.path.dirname(path), os.path.dirname(os.path.dirname(path))):
+            linter = os.path.join(root_dir, "lint_design.py")
+            if os.path.isfile(linter):
+                try:
+                    import importlib.util as _ilu
+                    spec = _ilu.spec_from_file_location("_lint_design", linter)
+                    mod = _ilu.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    lint = [f.as_dict() for f in mod.lint_source(source, path)]
+                except Exception as exc:
+                    lint = [{"code": "L000", "line": 0, "severity": "warning",
+                             "message": f"linter failed: {type(exc).__name__}: {exc}"}]
+                break
+
+        doc_info = None
+        if document:
+            _doc, doc_info = self._owned_document(str(document), bool(fresh))
         design = self._design()
         ns = {
             "adsk": adsk,
@@ -3927,28 +4115,40 @@ class CommandHandler:
         # "edit the lib, rebuild" actually mean what it says.
         prefixes = [r.rstrip(os.sep) + os.sep for r in roots]
 
-        def _under_script_tree(mod):
+        def _in_tree(p):
+            p = os.path.abspath(str(p))
+            return any(p.startswith(pre) or pre.rstrip(os.sep) == p
+                       for pre in prefixes)
+
+        def _under_script_tree(mod_name, mod):
+            # Fusion's own API is off limits whatever the paths say.
+            if mod_name == "adsk" or mod_name.startswith("adsk."):
+                return False
             f = getattr(mod, "__file__", None)
             if f:
-                f = os.path.abspath(f)
-                return any(f.startswith(pre) for pre in prefixes)
+                return _in_tree(f)
             # Namespace packages (a directory with no __init__.py, which is
             # exactly what scripts/lib is) have __file__ = None and must be
             # matched on __path__ instead.  Missing them is worse than useless:
             # the stale package object keeps a reference to the old submodule,
             # so evicting "lib.fusionlib" alone still resolves
             # "from lib import fusionlib" to the previous version.
-            for entry in getattr(mod, "__path__", None) or []:
-                entry = os.path.abspath(str(entry))
-                if any(entry.startswith(pre) or pre.rstrip(os.sep) == entry
-                       for pre in prefixes):
-                    return True
-            return False
+            #
+            # But a namespace __path__ is recomputed from sys.path on every
+            # iteration, and the script's directories were just added to
+            # sys.path.  A stray folder named after an existing namespace
+            # package — a scratch dir called "adsk" is how this was found —
+            # then shows up as one more portion of that package, and evicting
+            # it throws away the real thing: the next `import adsk.fusion`
+            # builds a bare package and fails with "no attribute 'fusion'".
+            # So a namespace package is ours only if EVERY portion is.
+            entries = [str(e) for e in (getattr(mod, "__path__", None) or [])]
+            return bool(entries) and all(_in_tree(e) for e in entries)
 
         evicted = []
         for mod_name, mod in list(sys.modules.items()):
             try:
-                if _under_script_tree(mod):
+                if _under_script_tree(mod_name, mod):
                     del sys.modules[mod_name]
                     evicted.append(mod_name)
             except Exception:
@@ -3988,7 +4188,7 @@ class CommandHandler:
             except (TypeError, ValueError):
                 returned = str(returned)
 
-        return {
+        result = {
             "script": path,
             "source_bytes": len(source),
             "reloaded_modules": sorted(evicted),
@@ -3996,10 +4196,99 @@ class CommandHandler:
             "returned": returned,
             "output": buf.getvalue(),
             "bodies": sum(1 for _ in self._all_bodies()),
-            "sketches": root.sketches.count,
+            "sketches": self._sketch_count(),
             "components": root.allOccurrences.count,
             "timeline": design.timeline.count if hasattr(design, "timeline") else 0,
         }
+        if lint is not None:
+            result["lint"] = lint
+            result["lint_errors"] = sum(1 for f in lint if f["severity"] == "error")
+        if doc_info is not None:
+            active = self.app.activeDocument
+            doc_info["still_active"] = bool(active and active.name == doc_info["name"])
+            result["document"] = doc_info
+
+        # Contract and trace, if the script used fusionlib.  The library was
+        # just (re)imported by the script, so read it out of sys.modules rather
+        # than importing it here — the handler must never depend on it.
+        fl = sys.modules.get("lib.fusionlib")
+        contract = trace = None
+        if fl is not None and hasattr(fl, "contract_results"):
+            try:
+                contract = fl.contract_results()
+                trace = fl.trace_results()
+            except Exception as exc:
+                result["report_error"] = f"{type(exc).__name__}: {exc}"
+        if contract is not None:
+            result["contract"] = contract
+        if trace is not None:
+            key = (path, document or "")
+            previous = self._last_trace.get(key)
+            if previous:
+                prev_by_step = {}
+                for row in previous:
+                    prev_by_step.setdefault(row["step"], []).append(row)
+                seen = {}
+                for row in trace:
+                    k = seen.get(row["step"], 0)
+                    seen[row["step"]] = k + 1
+                    olds = prev_by_step.get(row["step"], [])
+                    if k < len(olds) and "delta_mm3" in row and "delta_mm3" in olds[k]:
+                        row["delta_vs_previous_build_mm3"] = round(
+                            row["delta_mm3"] - olds[k]["delta_mm3"], 4)
+            self._last_trace[key] = trace
+            result["trace"] = trace
+            changed = [r for r in trace
+                       if abs(r.get("delta_vs_previous_build_mm3", 0.0)) > 1e-6]
+            result["trace_changed_steps"] = [
+                {"step": r["step"], "delta_vs_previous_build_mm3":
+                 r["delta_vs_previous_build_mm3"]} for r in changed]
+
+        if verify:
+            bodies = []
+            for body, comp_name in self._all_bodies():
+                try:
+                    bodies.append({
+                        "name": body.name, "component": comp_name,
+                        "volume_mm3": round(body.volume * 1000.0, 4),
+                        "bbox_mm": self._bbox_mm(body.boundingBox),
+                    })
+                except Exception as exc:
+                    bodies.append({"name": getattr(body, "name", "?"),
+                                   "error": f"{type(exc).__name__}: {exc}"})
+            problems = self._timeline_problems(design)
+            result["verify"] = {
+                "bodies": bodies,
+                "timeline_problems": problems,
+                "has_problems": bool(problems),
+                "parameters": design.userParameters.count,
+            }
+
+        if contract is not None and contract["failed"]:
+            failing = [c for c in contract["checks"] if not c["ok"]]
+            lines = []
+            for c in failing:
+                if "expected" in c:
+                    lines.append(
+                        f"{c['name']}: actual {c['actual']} vs expected "
+                        f"{c['expected']} (diff {c.get('diff')}, tol {c.get('tol')})")
+                else:
+                    lines.append(f"{c['name']}: {c.get('detail', 'condition false')}")
+            result.update({
+                "ok": False,
+                "error_kind": "CONTRACT_FAILED",
+                "error_message": (
+                    f"{contract['failed']} of {len(contract['checks'])} design "
+                    f"contract check(s) failed in {os.path.basename(path)}: "
+                    + "; ".join(lines)),
+                "hints": [
+                    "The model built, but it is not the model the script says "
+                    "it should be. Compare the trace's delta_vs_previous_build_mm3 "
+                    "per step to see which feature moved, then fix the script — "
+                    "not the model.",
+                ],
+            })
+        return result
 
     # ── fusion_reset ───────────────────────────────────────────────────
 
@@ -4289,9 +4578,134 @@ class CommandHandler:
 
     # ── fusion_analyze ─────────────────────────────────────────────────
 
+    def _wall_thickness_mm(self, body, samples: int = 40) -> dict:
+        """Thinnest wall in *body*, measured between opposed parallel faces.
+
+        Fusion has no thickness query and ``findBRepUsingRay`` lives on
+        Component, not BRepBody, and returns faces rather than hit distances.
+        So this does the arithmetic directly: for every planar face, find the
+        planar faces whose normal is anti-parallel to it, and take the
+        distance from the face's own point to that plane, keeping only
+        distances where the second face actually lies across the material
+        (the inward direction) and the two faces overlap in projection.
+
+        That covers exactly the case that matters — a plate, a rib, a boss
+        wall, the floor under a pocket — and honestly reports what it
+        sampled. A curved wall is not measured, which is why the result says
+        how many faces went into it rather than claiming a global minimum.
+
+        A wall under two extrusion widths cannot be printed as drawn: the
+        slicer thins it or drops it, and nothing in the model says so.
+        """
+        planar = []
+        for i in range(body.faces.count):
+            f = body.faces.item(i)
+            g = f.geometry
+            if not isinstance(g, adsk.core.Plane):
+                continue
+            n = g.normal
+            # geometry.normal follows the surface parameterisation, which is
+            # reversed on roughly half the faces of a solid; the outward
+            # normal is what "across the material" is measured against.
+            if getattr(f, "isParamReversed", False):
+                n = adsk.core.Vector3D.create(-n.x, -n.y, -n.z)
+            planar.append((f, g, n, f.area * 100.0))
+        if not planar:
+            return {"sampled_faces": 0, "min_wall_mm": None}
+        planar.sort(key=lambda t: -t[3])
+        planar = planar[:int(samples)]
+
+        def overlap(fa, fb, n) -> bool:
+            """Do the faces face each other across material, or merely lie in
+            opposed planes somewhere else on the part?
+
+            Overlap is tested only ACROSS the normal: two opposed faces are
+            separated along it by definition, so requiring overlap on all
+            three axes rejects every genuine pair — which is exactly what an
+            earlier version of this did, reporting no wall at all for a plain
+            box.
+            """
+            a, b = fa.boundingBox, fb.boundingBox
+            for axis, comp in (("x", n.x), ("y", n.y), ("z", n.z)):
+                if abs(comp) > 0.9:
+                    continue          # this is the through-thickness axis
+                amin, amax = getattr(a.minPoint, axis), getattr(a.maxPoint, axis)
+                bmin, bmax = getattr(b.minPoint, axis), getattr(b.maxPoint, axis)
+                if amin > bmax + 1e-6 or bmin > amax + 1e-6:
+                    return False
+            return True
+
+        thinnest, where, pair = None, None, None
+        for fa, ga, na, _ in planar:
+            oa = fa.pointOnFace
+            for fb, gb, nb, _ in planar:
+                if fb == fa:
+                    continue
+                dot = na.x * nb.x + na.y * nb.y + na.z * nb.z
+                if dot > -0.999:            # not facing each other
+                    continue
+                # Signed distance from fa's point to fb's plane, measured
+                # along fa's INWARD normal: positive means fb is across the
+                # material from fa, negative means it is behind it.
+                ob = gb.origin
+                d = ((ob.x - oa.x) * -na.x + (ob.y - oa.y) * -na.y
+                     + (ob.z - oa.z) * -na.z) * 10.0
+                if d <= 1e-4:
+                    continue
+                if not overlap(fa, fb, na):
+                    continue
+                if thinnest is None or d < thinnest:
+                    thinnest = d
+                    where = [round(self._mm(oa.x), 3), round(self._mm(oa.y), 3),
+                             round(self._mm(oa.z), 3)]
+                    pair = [fa.area * 100.0, fb.area * 100.0]
+        return {"sampled_faces": len(planar),
+                "min_wall_mm": round(thinnest, 4) if thinnest is not None else None,
+                "at_mm": where,
+                "face_areas_mm2": ([round(pair[0], 2), round(pair[1], 2)]
+                                   if pair else None)}
+
+    def _orientation_report(self, body, overhang_deg: float) -> list:
+        """Overhang area for each of the six axis-aligned print orientations.
+
+        The part is not rotated; the threshold is applied against each axis in
+        turn, which is the same arithmetic and costs one pass over the faces
+        instead of six rebuilds. Lowest overhang area wins, and "as modelled"
+        is +Z so the report says plainly whether turning the part over helps.
+        """
+        import math as _math
+
+        threshold = _math.cos(_math.radians(float(overhang_deg)))
+        dirs = {"+Z (as modelled)": (0, 0, 1), "-Z (flipped)": (0, 0, -1),
+                "+X": (1, 0, 0), "-X": (-1, 0, 0),
+                "+Y": (0, 1, 0), "-Y": (0, -1, 0)}
+        out = []
+        faces = []
+        for i in range(body.faces.count):
+            f = body.faces.item(i)
+            if isinstance(f.geometry, adsk.core.Plane):
+                n = f.geometry.normal
+                nz = (-n.x, -n.y, -n.z) if getattr(f, "isParamReversed", False) \
+                    else (n.x, n.y, n.z)
+                faces.append((nz, f.area * 100.0))
+        for label, up in dirs.items():
+            area, count = 0.0, 0
+            for n, a in faces:
+                # Component of the face normal along the build direction.
+                along = n[0] * up[0] + n[1] * up[1] + n[2] * up[2]
+                if along < -threshold - 1e-9:
+                    area += a
+                    count += 1
+            out.append({"orientation": label, "overhang_faces": count,
+                        "overhang_area_mm2": round(area, 3)})
+        out.sort(key=lambda r: r["overhang_area_mm2"])
+        return out
+
     def fusion_analyze(self, overhang_deg: float = 45.0,
                        min_feature_mm: float = 0.8,
-                       build_volume_mm=None, body_name: str = None):
+                       build_volume_mm=None, body_name: str = None,
+                       wall_check: bool = True, nozzle_mm: float = 0.4,
+                       orientation: bool = True):
         """Manufacturability analysis.  See the tool docstring."""
         import math as _math
 
@@ -4364,6 +4778,30 @@ class CommandHandler:
                 entry["mass_g"] = None
                 entry["mass_error"] = f"{type(exc).__name__}: {exc}"
 
+            if wall_check:
+                wall = self._wall_thickness_mm(body)
+                entry["wall"] = wall
+                mw = wall.get("min_wall_mm")
+                if mw is not None and mw < 2.0 * float(nozzle_mm):
+                    warnings.append(
+                        f"{body.name}: thinnest wall {mw:.3f} mm is under two "
+                        f"{nozzle_mm} mm extrusions at {wall.get('at_mm')} — "
+                        f"the slicer will thin it or drop it entirely")
+
+            if orientation:
+                orient = self._orientation_report(body, overhang_deg)
+                entry["orientations"] = orient
+                best, current = orient[0], next(
+                    o for o in orient if o["orientation"].startswith("+Z"))
+                entry["best_orientation"] = best["orientation"]
+                if best["orientation"] != current["orientation"] and \
+                        best["overhang_area_mm2"] < current["overhang_area_mm2"] * 0.75:
+                    warnings.append(
+                        f"{body.name}: printing {best['orientation']} would "
+                        f"cut overhang area from "
+                        f"{current['overhang_area_mm2']:.0f} to "
+                        f"{best['overhang_area_mm2']:.0f} mm^2")
+
             if build_volume_mm:
                 fits = all(size[k] <= float(build_volume_mm[k]) + 1e-6
                            for k in range(3))
@@ -4391,6 +4829,7 @@ class CommandHandler:
             "clean": not warnings,
             "overhang_threshold_deg": float(overhang_deg),
             "min_feature_mm": float(min_feature_mm),
+            "nozzle_mm": float(nozzle_mm) if wall_check else None,
             "build_volume_mm": list(build_volume_mm) if build_volume_mm else None,
             "bodies": results,
             "warnings": warnings,
@@ -4399,10 +4838,15 @@ class CommandHandler:
 
     # ── fusion_sweep_joint ─────────────────────────────────────────────
 
+    def _min_distance_mm(self, body_a, body_b) -> float:
+        measure = self.app.measureManager
+        return float(measure.measureMinimumDistance(body_a, body_b).value) * 10.0
+
     def fusion_sweep_joint(self, joint_name: str, start=None, stop=None,
                            steps: int = 9, bodies=None,
                            include_coincident_faces: bool = False,
-                           stop_on_collision: bool = False, couple=None):
+                           stop_on_collision: bool = False, couple=None,
+                           clearance_pairs=None):
         """Drive a joint through its range checking interference at each step.
 
         See the tool docstring.  Always restores the joint's original value,
@@ -4464,6 +4908,25 @@ class CommandHandler:
             punit = "mm" if "value_mm" in pstate else "deg"
             coupled_before = pstate.get(f"value_{punit}") or 0.0
 
+        # Clearance: minimum distance between named body pairs at every
+        # step.  Interference only says whether parts overlap; a sliding fit
+        # is about how much air is left, and a 0.3 mm design clearance that
+        # measures 0.05 mm at one end of the travel is a bug nothing else sees.
+        pairs = []
+        if clearance_pairs:
+            by_name = {b.name: b for b, _ in self._all_bodies()}
+            for pair in clearance_pairs:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise RuntimeError(
+                        f"clearance_pairs entries must be [body_a, body_b]: {pair}")
+                a, b = pair
+                if a not in by_name or b not in by_name:
+                    raise RuntimeError(
+                        f"clearance pair {pair}: unknown body. "
+                        f"Available: {sorted(by_name)}")
+                pairs.append((a, b, by_name[a], by_name[b]))
+        min_clearance = None
+
         results = []
         first_collision = None
         worst = None
@@ -4497,6 +4960,23 @@ class CommandHandler:
                         for p in inter["interferences"]
                     ],
                 }
+                if pairs:
+                    clearances = []
+                    for a, b, ba, bb in pairs:
+                        try:
+                            d = round(self._min_distance_mm(ba, bb), 6)
+                        except Exception as exc:
+                            clearances.append({"pair": [a, b],
+                                               "error": f"{type(exc).__name__}: {exc}"})
+                            continue
+                        clearances.append({"pair": [a, b], "min_distance_mm": d})
+                        tightest = (min_clearance is None
+                                    or d < min_clearance["min_distance_mm"])
+                        if tightest:
+                            min_clearance = {
+                                "pair": [a, b], "min_distance_mm": d,
+                                "step": i, f"value_{unit}": round(value, 6)}
+                    entry["clearances"] = clearances
                 results.append(entry)
                 if not inter["clean"]:
                     if first_collision is None:
@@ -4531,6 +5011,7 @@ class CommandHandler:
             "restored_to": original,
             "coupled": ({"joint": coupled_name, "ratio": coupled_ratio,
                          "offset": coupled_offset} if coupled_name else None),
+            "min_clearance": min_clearance,
             "profile": results,
         }
 

@@ -121,6 +121,8 @@ class Fusion360Connection:
         }
         if self._secret is not None:
             envelope["token"] = self._secret
+        # Identify this process in the add-in log (see socket_server._dispatch).
+        envelope["client"] = os.environ.get("FUSION_MCP_CLIENT", "mcp-server")
         payload = json.dumps(envelope) + "\n"
 
         try:

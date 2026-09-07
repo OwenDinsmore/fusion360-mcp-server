@@ -918,7 +918,7 @@ def _render_view(p: dict) -> dict:
 # ── agent-facing tools (fusion_*) ────────────────────────────────────
 
 
-def _fusion_screenshot(p: dict) -> dict:
+def _fusion_screenshot_base(p: dict) -> dict:
     views = p.get("views") or ["iso"]
     if isinstance(views, str):
         views = [views]
@@ -1104,7 +1104,7 @@ def _fusion_check_interference(p: dict) -> dict:
 
 def _fusion_rebuild(p: dict) -> dict:
     path = p.get("script_path", "/tmp/mock_design.py")
-    return {
+    out = {
         "script": path,
         "source_bytes": 1234,
         "elapsed_s": 0.42,
@@ -1114,7 +1114,24 @@ def _fusion_rebuild(p: dict) -> dict:
         "sketches": 1,
         "components": 1,
         "timeline": 3,
+        "contract": {"checks": [], "passed": 0, "failed": 0, "failures": []},
+        "trace": [{"step": "Body", "volume_mm3": 1000.0, "bodies": 1,
+                   "delta_mm3": 1000.0}],
+        "trace_changed_steps": [],
     }
+    if p.get("document"):
+        out["document"] = {"tag": p["document"], "name": "MockDesign",
+                           "created": True, "recycled": bool(p.get("fresh")),
+                           "still_active": True}
+    if p.get("verify", True):
+        out["verify"] = {
+            "bodies": [{"name": "Body", "component": "Mock",
+                        "volume_mm3": 1000.0,
+                        "bbox_mm": {"min": [0, 0, 0], "max": [10, 10, 10],
+                                    "size": [10, 10, 10]}}],
+            "timeline_problems": [], "has_problems": False, "parameters": 0,
+        }
+    return out
 
 
 def _fusion_reset(p: dict) -> dict:
@@ -1172,7 +1189,7 @@ def _fusion_execute(p: dict) -> dict:
     }
 
 
-def _fusion_analyze(p: dict) -> dict:
+def _fusion_analyze_base(p: dict) -> dict:
     bv = p.get("build_volume_mm")
     return {
         "clean": True,
@@ -1200,7 +1217,7 @@ def _fusion_analyze(p: dict) -> dict:
     }
 
 
-def _fusion_sweep_joint(p: dict) -> dict:
+def _fusion_sweep_joint_base(p: dict) -> dict:
     start = float(p.get("start", 0.0))
     stop = float(p.get("stop", 10.0))
     steps = int(p.get("steps", 9))
@@ -1248,6 +1265,46 @@ def _default_mock(p: dict) -> dict:
 
 
 # ── dispatch table ────────────────────────────────────────────────────
+
+
+def _fusion_analyze(p: dict) -> dict:
+    out = _fusion_analyze_base(p)
+    for body in out.get("bodies", []):
+        if p.get("wall_check", True):
+            body["wall"] = {"sampled_faces": 6, "min_wall_mm": 2.0,
+                            "at_mm": [0.0, 0.0, 1.0]}
+        if p.get("orientation", True):
+            body["orientations"] = [
+                {"orientation": "-Z (flipped)", "overhang_faces": 0,
+                 "overhang_area_mm2": 0.0},
+                {"orientation": "+Z (as modelled)", "overhang_faces": 1,
+                 "overhang_area_mm2": 100.0},
+            ]
+            body["best_orientation"] = "-Z (flipped)"
+    out["nozzle_mm"] = p.get("nozzle_mm", 0.4) if p.get("wall_check", True) else None
+    return out
+
+
+def _fusion_screenshot(p: dict) -> dict:
+    out = _fusion_screenshot_base(p)
+    out["section"] = p.get("section") or None
+    return out
+
+
+def _fusion_sweep_joint(p: dict) -> dict:
+    out = _fusion_sweep_joint_base(p)
+    pairs = p.get("clearance_pairs") or []
+    if pairs:
+        for i, step in enumerate(out.get("profile", [])):
+            step["clearances"] = [
+                {"pair": list(pair), "min_distance_mm": 0.3} for pair in pairs
+            ]
+        out["min_clearance"] = {"pair": list(pairs[0]), "min_distance_mm": 0.3,
+                                "step": 0}
+    else:
+        out["min_clearance"] = None
+    return out
+
 
 _DISPATCH: dict[str, Any] = {
     "ping": _ping,
@@ -1368,3 +1425,4 @@ _DISPATCH: dict[str, Any] = {
     "fusion_sweep_joint": _fusion_sweep_joint,
     "fusion_execute": _fusion_execute,
 }
+

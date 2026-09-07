@@ -134,7 +134,8 @@ class Fusion360MCPServer:
                 client, addr = self._socket.accept()
                 log.info("Client connected: %s", addr)
                 t = threading.Thread(
-                    target=self._handle_client, args=(client,), daemon=True)
+                    target=self._handle_client, args=(client, addr),
+                    daemon=True)
                 t.start()
             except socket.timeout:
                 continue
@@ -147,9 +148,13 @@ class Fusion360MCPServer:
     # Per-client handler (daemon thread)
     # ------------------------------------------------------------------
 
-    def _handle_client(self, client: socket.socket):
+    def _handle_client(self, client: socket.socket, addr=None):
         client.settimeout(None)
         buf = b""
+        # Peer address doubles as a client id in the log, so two sessions
+        # driving the same Fusion can be told apart.  A client may also name
+        # itself with a "client" field, which is preferred when present.
+        peer = f"{addr[0]}:{addr[1]}" if addr else "?"
 
         try:
             while self._running:
@@ -170,7 +175,7 @@ class Fusion360MCPServer:
                         self._send(client, {
                             "status": "error", "message": "Invalid JSON"})
                         continue
-                    self._dispatch(client, command)
+                    self._dispatch(client, command, peer)
 
                 # Fallback: try raw JSON blob (no newline framing)
                 if buf:
@@ -179,7 +184,7 @@ class Fusion360MCPServer:
                         try:
                             command = json.loads(stripped)
                             buf = b""
-                            self._dispatch(client, command)
+                            self._dispatch(client, command, peer)
                         except json.JSONDecodeError:
                             pass  # incomplete — wait for more data
         except Exception:
@@ -196,9 +201,11 @@ class Fusion360MCPServer:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _dispatch(self, client, command):
+    def _dispatch(self, client, command, peer="?"):
         """Submit command to bridge and send response back to client."""
         cmd_type = command.get("type", "")
+        name = command.get("client")
+        command["_client"] = f"{name}@{peer}" if name else peer
 
         # Checked before anything else, including ping and reload_handler.
         # An unauthenticated caller must not be able to probe for the bridge's
