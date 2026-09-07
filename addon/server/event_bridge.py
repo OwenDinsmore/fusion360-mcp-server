@@ -130,7 +130,27 @@ class EventBridge:
     # ------------------------------------------------------------------
 
     def drain_queue(self):
-        """Execute every queued work item (main thread only)."""
+        """Execute every queued work item (main thread only).
+
+        Not re-entrant, and it has to say so. Handlers that call
+        adsk.doEvents() — anything that drives a joint does — pump Fusion's
+        event queue from inside the running command, and the custom event
+        that pumps THIS queue is on it. Without the guard a second command
+        can start executing inside the first: a queued rebuild wipes the
+        document the running rebuild is still building, which then dies with
+        "An API Object refers to a deleted Object". The skipped drain is not
+        lost; the 200ms backup timer fires the event again once the current
+        command returns.
+        """
+        if getattr(self, "_draining", False):
+            return
+        self._draining = True
+        try:
+            self._drain_queue_inner()
+        finally:
+            self._draining = False
+
+    def _drain_queue_inner(self):
         while True:
             try:
                 item: WorkItem = self._queue.get_nowait()
