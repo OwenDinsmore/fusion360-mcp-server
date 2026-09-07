@@ -10,3 +10,6 @@ build/
 *.log
 
 .worktrees
+
+# macOS
+.DS_Store
