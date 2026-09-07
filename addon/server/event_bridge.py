@@ -6,6 +6,7 @@ happen on the main thread.  A 200 ms backup timer fires the custom event
 periodically in case fireCustomEvent from a daemon thread is unreliable.
 """
 
+import os
 import queue
 import threading
 import time
@@ -19,6 +20,23 @@ log = get_logger("bridge")
 
 CUSTOM_EVENT_ID = "Fusion360MCP_BridgeEvent"
 TIMER_INTERVAL_MS = 200  # backup polling interval
+
+# Most commands are interactive and should fail fast if Fusion has wedged —
+# a modal dialog blocks the main thread and every call queues behind it.
+# Builds are different: a live-parametric rebuild spends real seconds in the
+# constraint solver, and a 47-tooth patterned rack alone can take a minute.
+# Failing those at 30s turns a slow build into a broken one.
+DEFAULT_TIMEOUT = 30.0
+LONG_TIMEOUT = float(os.environ.get("FUSION_MCP_BUILD_TIMEOUT", "600"))
+LONG_COMMANDS = frozenset({
+    "fusion_rebuild", "fusion_execute", "execute_code", "fusion_reset",
+    "delete_all", "fusion_export", "export", "export_stl", "export_step",
+    "export_f3d", "cam_generate_toolpath", "cam_post_process",
+})
+
+
+def timeout_for(command_type: str) -> float:
+    return LONG_TIMEOUT if command_type in LONG_COMMANDS else DEFAULT_TIMEOUT
 
 
 class WorkItem:
@@ -74,7 +92,7 @@ class EventBridge:
     # Called from socket (daemon) threads
     # ------------------------------------------------------------------
 
-    def submit(self, command: dict, timeout: float = 30.0) -> dict:
+    def submit(self, command: dict, timeout: float = None) -> dict:
         """Queue *command* for main-thread execution; block until done."""
         cmd_type = command.get("type", "?")
 
@@ -83,7 +101,9 @@ class EventBridge:
             log.debug("ping (fast path)")
             return {"status": "success", "result": {"pong": True}}
 
-        log.debug("submit cmd=%s", cmd_type)
+        if timeout is None:
+            timeout = timeout_for(cmd_type)
+        log.debug("submit cmd=%s (timeout %ss)", cmd_type, timeout)
         item = WorkItem(command)
         self._queue.put(item)
 

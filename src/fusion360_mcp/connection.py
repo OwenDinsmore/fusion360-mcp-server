@@ -21,7 +21,10 @@ log = logging.getLogger("fusion360_mcp.connection")
 _DEFAULT_HOST = os.environ.get("FUSION_MCP_HOST", "localhost")
 _DEFAULT_PORT = int(os.environ.get("FUSION_MCP_PORT", "9876"))
 _RECV_BUF = 65536
-_TIMEOUT = 30.0  # matches the add-in's bridge timeout
+# Slightly over the add-in's longest command budget, so the add-in times
+# out first and returns a useful message rather than the client giving up
+# blind. Keep this above FUSION_MCP_BUILD_TIMEOUT.
+_TIMEOUT = float(os.environ.get("FUSION_MCP_CLIENT_TIMEOUT", "610"))
 _PING_TIMEOUT = 5.0
 _MAX_RETRIES = 2
 _RETRY_DELAY = 1.0  # seconds between reconnect attempts
