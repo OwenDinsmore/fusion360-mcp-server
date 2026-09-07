@@ -3563,7 +3563,10 @@ class CommandHandler:
             },
             "counts": {
                 "bodies": len(bodies) if include_bodies else None,
-                "sketches": root.sketches.count,
+                # Sketches inside components are still sketches; counting only
+                # root.sketches reports 0 for any design built the normal way.
+                "sketches": self._sketch_count(),
+                "sketches_root_only": root.sketches.count,
                 "components": root.allOccurrences.count,
                 "joints": len(joints),
                 "parameters": len(parameters),
@@ -3578,6 +3581,14 @@ class CommandHandler:
                 "has_problems": bool(timeline_problems),
             },
         }
+
+    def _sketch_count(self) -> int:
+        """Sketches across the root component and every occurrence."""
+        root = self._root()
+        total = root.sketches.count
+        for occ in root.allOccurrences:
+            total += occ.component.sketches.count
+        return total
 
     def _joint_state(self, joint):
         """Type, current value and limits for one joint, in mm / degrees."""
@@ -3885,11 +3896,47 @@ class CommandHandler:
         # The script's own directory goes on sys.path so a design can
         # `from lib import fusionlib` without any packaging ceremony.
         script_dir = os.path.dirname(path)
+        roots = [c for c in (script_dir, os.path.dirname(script_dir)) if c]
         added_paths = []
-        for candidate in (script_dir, os.path.dirname(script_dir)):
-            if candidate and candidate not in sys.path:
+        for candidate in roots:
+            if candidate not in sys.path:
                 sys.path.insert(0, candidate)
                 added_paths.append(candidate)
+
+        # Drop cached modules that live under the script tree.  Fusion's
+        # Python process is long-lived, so an imported helper library stays in
+        # sys.modules across rebuilds and edits to it are silently ignored —
+        # you get a traceback whose line numbers match the file on disk but
+        # whose behaviour is the previous version.  Evicting them makes
+        # "edit the lib, rebuild" actually mean what it says.
+        prefixes = [r.rstrip(os.sep) + os.sep for r in roots]
+
+        def _under_script_tree(mod):
+            f = getattr(mod, "__file__", None)
+            if f:
+                f = os.path.abspath(f)
+                return any(f.startswith(pre) for pre in prefixes)
+            # Namespace packages (a directory with no __init__.py, which is
+            # exactly what scripts/lib is) have __file__ = None and must be
+            # matched on __path__ instead.  Missing them is worse than useless:
+            # the stale package object keeps a reference to the old submodule,
+            # so evicting "lib.fusionlib" alone still resolves
+            # "from lib import fusionlib" to the previous version.
+            for entry in getattr(mod, "__path__", None) or []:
+                entry = os.path.abspath(str(entry))
+                if any(entry.startswith(pre) or pre.rstrip(os.sep) == entry
+                       for pre in prefixes):
+                    return True
+            return False
+
+        evicted = []
+        for mod_name, mod in list(sys.modules.items()):
+            try:
+                if _under_script_tree(mod):
+                    del sys.modules[mod_name]
+                    evicted.append(mod_name)
+            except Exception:
+                continue
 
         buf = io.StringIO()
         t0 = time.monotonic()
@@ -3900,10 +3947,13 @@ class CommandHandler:
                 returned = main(**(args or {})) if callable(main) else None
         except Exception as exc:
             # Surface the script's own traceback, not the bridge's.
+            # The envelope already carries a full traceback that includes the
+            # script's own frames; repeating it here just doubles the noise.
+            printed = buf.getvalue()
             raise RuntimeError(
-                f"{type(exc).__name__} in {os.path.basename(path)}: {exc}\n"
-                f"{traceback.format_exc()}\n"
-                f"--- script output before failure ---\n{buf.getvalue()}"
+                f"{type(exc).__name__} in {os.path.basename(path)}: {exc}"
+                + (f"\n--- script output before failure ---\n{printed}"
+                   if printed else "")
             ) from exc
         finally:
             for p in added_paths:
@@ -3925,6 +3975,7 @@ class CommandHandler:
         return {
             "script": path,
             "source_bytes": len(source),
+            "reloaded_modules": sorted(evicted),
             "elapsed_s": round(elapsed, 3),
             "returned": returned,
             "output": buf.getvalue(),

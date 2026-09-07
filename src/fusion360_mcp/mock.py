@@ -976,7 +976,8 @@ def _fusion_inspect(p: dict) -> dict:
         },
         "counts": {
             "bodies": len(bodies) if include_bodies else None,
-            "sketches": 1,
+            "sketches": 5,
+            "sketches_root_only": 0,
             "components": 1,
             "joints": 1,
             "parameters": 2,

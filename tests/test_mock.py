@@ -1077,3 +1077,14 @@ class TestMultiImageFormatting:
         summary = blocks[0].text
         assert "image_base64" not in summary
         assert "images" not in summary
+
+
+class TestInspectSketchCounting:
+    """Sketches inside components must be counted, not just root sketches."""
+
+    def test_counts_include_component_sketches(self):
+        counts = mock_command("fusion_inspect", {})["counts"]
+        # A design built the normal way puts its sketches in a component, so
+        # a root-only count reports 0 and hides the entire design.
+        assert counts["sketches"] >= counts["sketches_root_only"]
+        assert counts["sketches"] > 0
