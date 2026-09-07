@@ -58,6 +58,7 @@ _MUTATION_MOCKS: frozenset[str] = frozenset(
         "execute_code",
         "fusion_params",
         "fusion_drive_joint",
+        "fusion_sweep_joint",
         "fusion_rebuild",
         "fusion_reset",
         "fusion_execute",
@@ -1199,6 +1200,46 @@ def _fusion_analyze(p: dict) -> dict:
     }
 
 
+def _fusion_sweep_joint(p: dict) -> dict:
+    start = float(p.get("start", 0.0))
+    stop = float(p.get("stop", 10.0))
+    steps = int(p.get("steps", 9))
+    couple = p.get("couple")
+    profile = []
+    for i in range(steps):
+        value = start + (stop - start) * (i / (steps - 1))
+        entry = {
+            "step": i,
+            "value_mm": round(value, 6),
+            "clean": True,
+            "interference_count": 0,
+            "worst_overlap_mm3": 0.0,
+            "pairs": [],
+        }
+        if couple:
+            entry["coupled_value"] = round(
+                value * float(couple.get("ratio", 1.0))
+                + float(couple.get("offset", 0.0)), 6)
+        profile.append(entry)
+    return {
+        "joint": p.get("joint_name", "Joint1"),
+        "type": "slider",
+        "unit": "mm",
+        "start": start,
+        "stop": stop,
+        "steps": len(profile),
+        "clean": True,
+        "first_collision": None,
+        "worst": None,
+        "restored_to": 0.0,
+        "coupled": ({"joint": couple.get("joint"),
+                     "ratio": float(couple.get("ratio", 1.0)),
+                     "offset": float(couple.get("offset", 0.0))}
+                    if couple else None),
+        "profile": profile,
+    }
+
+
 # ── default fallback ─────────────────────────────────────────────────
 
 
@@ -1324,5 +1365,6 @@ _DISPATCH: dict[str, Any] = {
     "fusion_reset": _fusion_reset,
     "fusion_export": _fusion_export,
     "fusion_analyze": _fusion_analyze,
+    "fusion_sweep_joint": _fusion_sweep_joint,
     "fusion_execute": _fusion_execute,
 }

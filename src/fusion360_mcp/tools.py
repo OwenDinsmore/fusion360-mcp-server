@@ -2639,6 +2639,56 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "fusion_sweep_joint",
+        "title": "Sweep Joint",
+        "description": (
+            "Drive a joint across its range, checking interference at every "
+            "step. This is how you find out whether a mechanism actually "
+            "works, rather than whether it happens to fit in the two or three "
+            "positions you thought to check.\n\n"
+            "joint_name  the joint to drive.\n"
+            "start/stop  range, in mm for slider-family joints or degrees for "
+            "revolute. Defaults to the joint's own limits.\n"
+            "steps       positions to sample, at least 2. Default 9.\n"
+            "bodies      restrict the interference check; omit for all.\n"
+            "stop_on_collision  stop at the first collision instead of "
+            "profiling the whole range.\n"
+            "couple      drive a SECOND joint as a linear function of the "
+            "first: {\"joint\": \"RackSlide\", \"ratio\": 0.0873, "
+            "\"offset\": 0}. Essential for geared pairs — turning a pinion "
+            "against a rack that cannot translate just grinds the teeth "
+            "together and reports interference that means nothing. For a rack "
+            "and pinion the ratio is pitch_radius * PI / 180 mm per degree.\n\n"
+            "Returns a per-step profile with the value, whether it was clean, "
+            "and the worst overlap volume, plus first_collision and worst. The "
+            "joint (and the coupled one) are always restored to where they "
+            "started, including when a step fails."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["joint_name"],
+            "properties": {
+                "joint_name": {"type": "string"},
+                "start": {"type": "number"},
+                "stop": {"type": "number"},
+                "steps": {"type": "integer", "minimum": 2},
+                "bodies": {"type": "array", "items": {"type": "string"}},
+                "include_coincident_faces": {"type": "boolean"},
+                "stop_on_collision": {"type": "boolean"},
+                "couple": {
+                    "type": "object",
+                    "description": "Second joint driven as ratio*value+offset",
+                    "properties": {
+                        "joint": {"type": "string"},
+                        "ratio": {"type": "number"},
+                        "offset": {"type": "number"},
+                    },
+                    "required": ["joint"],
+                },
+            },
+        },
+    },
 ]
 
 # ── tool annotations ──────────────────────────────────────────────────
@@ -2694,6 +2744,7 @@ _IDEMPOTENT = {
     "fusion_drive_joint",
     "fusion_export",
     "fusion_analyze",
+    "fusion_sweep_joint",
 }
 
 for _t in TOOLS:

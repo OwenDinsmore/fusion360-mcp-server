@@ -106,6 +106,7 @@ class CommandHandler:
             # agent-facing tools that change geometry
             "fusion_params",
             "fusion_drive_joint",
+            "fusion_sweep_joint",
             "fusion_rebuild",
             "fusion_reset",
             "fusion_execute",
@@ -217,6 +218,7 @@ class CommandHandler:
                 "fusion_reset": self.fusion_reset,
                 "fusion_export": self.fusion_export,
                 "fusion_analyze": self.fusion_analyze,
+                "fusion_sweep_joint": self.fusion_sweep_joint,
                 "fusion_execute": self.fusion_execute,
                 # CAM
                 "cam_list_setups": self.cam_list_setups,
@@ -4392,6 +4394,144 @@ class CommandHandler:
             "build_volume_mm": list(build_volume_mm) if build_volume_mm else None,
             "bodies": results,
             "warnings": warnings,
+        }
+
+
+    # ── fusion_sweep_joint ─────────────────────────────────────────────
+
+    def fusion_sweep_joint(self, joint_name: str, start=None, stop=None,
+                           steps: int = 9, bodies=None,
+                           include_coincident_faces: bool = False,
+                           stop_on_collision: bool = False, couple=None):
+        """Drive a joint through its range checking interference at each step.
+
+        See the tool docstring.  Always restores the joint's original value,
+        including when a step raises.
+        """
+        if steps < 2:
+            raise RuntimeError("steps must be at least 2")
+
+        joints = self._all_joints()
+        match = None
+        for j in joints:
+            if j.name == joint_name:
+                match = j
+                break
+        if match is None:
+            raise RuntimeError(
+                f"No joint named '{joint_name}'. "
+                f"Available: {[j.name for j in joints]}")
+
+        before = self._joint_state(match)
+        unit = "mm" if "value_mm" in before else "deg"
+        limits = before.get(f"limits_{unit}") or {}
+
+        if start is None:
+            start = limits.get("min") if limits.get("min_enabled") else 0.0
+        if stop is None:
+            stop = limits.get("max") if limits.get("max_enabled") else None
+        if stop is None:
+            raise RuntimeError(
+                f"Joint '{joint_name}' has no upper limit, so there is no "
+                f"range to sweep — pass an explicit stop.")
+
+        start, stop = float(start), float(stop)
+        original = before.get(f"value_{unit}") or 0.0
+
+        # A coupled joint is driven as a linear function of the primary one.
+        # Without it, sweeping a geared pair is physically meaningless: turn a
+        # pinion against a rack that cannot translate and the teeth simply
+        # grind, reporting interference that says nothing about whether the
+        # mechanism works.
+        coupled_name = coupled_ratio = coupled_offset = None
+        coupled_before = None
+        if couple:
+            coupled_name = couple.get("joint")
+            if not coupled_name:
+                raise RuntimeError("couple needs a 'joint' name")
+            coupled_ratio = float(couple.get("ratio", 1.0))
+            coupled_offset = float(couple.get("offset", 0.0))
+            partner = None
+            for j in joints:
+                if j.name == coupled_name:
+                    partner = j
+                    break
+            if partner is None:
+                raise RuntimeError(
+                    f"No joint named '{coupled_name}' to couple to. "
+                    f"Available: {[j.name for j in joints]}")
+            pstate = self._joint_state(partner)
+            punit = "mm" if "value_mm" in pstate else "deg"
+            coupled_before = pstate.get(f"value_{punit}") or 0.0
+
+        results = []
+        first_collision = None
+        worst = None
+        try:
+            for i in range(int(steps)):
+                frac = i / (steps - 1)
+                value = start + (stop - start) * frac
+                self.fusion_drive_joint(joint_name, value)
+                coupled_value = None
+                if coupled_name:
+                    coupled_value = coupled_ratio * value + coupled_offset
+                    self.fusion_drive_joint(coupled_name, coupled_value)
+                inter = self.fusion_check_interference(
+                    bodies=bodies,
+                    include_coincident_faces=include_coincident_faces)
+                worst_here = (max(p["overlap_volume_mm3"]
+                                  for p in inter["interferences"])
+                              if inter["interferences"] else 0.0)
+                entry = {
+                    "step": i,
+                    f"value_{unit}": round(value, 6),
+                    "clean": inter["clean"],
+                    "interference_count": inter["count"],
+                    **({"coupled_value": round(coupled_value, 6)}
+                       if coupled_value is not None else {}),
+                    "worst_overlap_mm3": round(worst_here, 6),
+                    "pairs": [
+                        {"body_one": p["body_one"], "body_two": p["body_two"],
+                         "overlap_volume_mm3": round(
+                             p["overlap_volume_mm3"], 6)}
+                        for p in inter["interferences"]
+                    ],
+                }
+                results.append(entry)
+                if not inter["clean"]:
+                    if first_collision is None:
+                        first_collision = entry
+                    if worst is None or worst_here > worst["worst_overlap_mm3"]:
+                        worst = entry
+                    if stop_on_collision:
+                        break
+        finally:
+            # Put the mechanism back where it was, even if a step blew up.
+            try:
+                self.fusion_drive_joint(joint_name, original)
+            except Exception:
+                pass
+            if coupled_name is not None and coupled_before is not None:
+                try:
+                    self.fusion_drive_joint(coupled_name, coupled_before)
+                except Exception:
+                    pass
+
+        clean = all(r["clean"] for r in results)
+        return {
+            "joint": joint_name,
+            "type": before["type"],
+            "unit": unit,
+            "start": start,
+            "stop": stop,
+            "steps": len(results),
+            "clean": clean,
+            "first_collision": first_collision,
+            "worst": worst,
+            "restored_to": original,
+            "coupled": ({"joint": coupled_name, "ratio": coupled_ratio,
+                         "offset": coupled_offset} if coupled_name else None),
+            "profile": results,
         }
 
     # ── fusion_execute ─────────────────────────────────────────────────

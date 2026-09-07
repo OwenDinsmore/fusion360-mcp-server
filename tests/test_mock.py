@@ -1123,3 +1123,30 @@ class TestAnalyze:
     def test_clean_means_no_warnings(self):
         result = mock_command("fusion_analyze", {})
         assert result["clean"] is (not result["warnings"])
+
+
+class TestSweepJoint:
+    """Sweeping is how a mechanism gets verified, not spot checks."""
+
+    def test_profiles_every_step(self):
+        result = mock_command(
+            "fusion_sweep_joint",
+            {"joint_name": "Slide", "start": 0, "stop": 58, "steps": 5})
+        assert len(result["profile"]) == 5
+        assert result["profile"][0]["value_mm"] == 0
+        assert result["profile"][-1]["value_mm"] == 58
+
+    def test_coupled_joint_is_driven_from_the_primary(self):
+        """A geared pair is meaningless unless both parts move together."""
+        result = mock_command("fusion_sweep_joint", {
+            "joint_name": "PinionRotate", "start": 0, "stop": 18, "steps": 3,
+            "couple": {"joint": "RackSlide", "ratio": 0.0873}})
+        assert result["coupled"]["joint"] == "RackSlide"
+        last = result["profile"][-1]
+        assert abs(last["coupled_value"] - 18 * 0.0873) < 1e-6
+
+    def test_reports_where_it_restored_to(self):
+        result = mock_command("fusion_sweep_joint", {"joint_name": "Slide"})
+        assert "restored_to" in result, (
+            "a sweep must put the mechanism back where it found it"
+        )
