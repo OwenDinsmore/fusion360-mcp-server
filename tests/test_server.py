@@ -107,6 +107,9 @@ class TestToolAnnotations:
             "cam_get_operation_info",
             "get_design_type",
             "render_view",
+            "fusion_screenshot",
+            "fusion_inspect",
+            "fusion_check_interference",
         }
         for t in TOOLS:
             ann = t["annotations"]
@@ -120,7 +123,7 @@ class TestToolAnnotations:
     def test_destructive_tools(self):
         from fusion360_mcp.tools import TOOLS
 
-        destructive = {"delete_all", "delete_parameter"}
+        destructive = {"delete_all", "delete_parameter", "fusion_reset"}
         for t in TOOLS:
             ann = t["annotations"]
             if t["name"] in destructive:

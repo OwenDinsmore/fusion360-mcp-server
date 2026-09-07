@@ -178,6 +178,16 @@ def test_expected_tools_present():
         "rename_body",
         # perception
         "render_view",
+        # agent-facing tools
+        "fusion_screenshot",
+        "fusion_inspect",
+        "fusion_params",
+        "fusion_drive_joint",
+        "fusion_check_interference",
+        "fusion_rebuild",
+        "fusion_reset",
+        "fusion_export",
+        "fusion_execute",
     }
     missing = expected - names
     assert not missing, f"Missing tools: {missing}"

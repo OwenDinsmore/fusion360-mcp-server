@@ -56,6 +56,11 @@ _MUTATION_MOCKS: frozenset[str] = frozenset(
         "undo",
         "set_parameter",
         "execute_code",
+        "fusion_params",
+        "fusion_drive_joint",
+        "fusion_rebuild",
+        "fusion_reset",
+        "fusion_execute",
     }
 )
 
@@ -909,6 +914,261 @@ def _render_view(p: dict) -> dict:
     }
 
 
+# ── agent-facing tools (fusion_*) ────────────────────────────────────
+
+
+def _fusion_screenshot(p: dict) -> dict:
+    views = p.get("views") or ["iso"]
+    if isinstance(views, str):
+        views = [views]
+    w = int(p.get("width", 1024))
+    h = int(p.get("height", 768))
+    images = [
+        {
+            "view": v,
+            "width": w,
+            "height": h,
+            "image_format": "png",
+            "image_base64": _MOCK_PNG_B64,
+            "bytes": len(_MOCK_PNG_B64),
+        }
+        for v in views
+    ]
+    return {
+        "count": len(images),
+        "views": [i["view"] for i in images],
+        "shaded": bool(p.get("shaded", True)),
+        "total_bytes": sum(i["bytes"] for i in images),
+        "images": images,
+    }
+
+
+def _fusion_inspect(p: dict) -> dict:
+    include_bodies = p.get("include_bodies", True)
+    bodies = (
+        [
+            {
+                "name": "Body1",
+                "component": "MockComponent",
+                "is_visible": True,
+                "volume_mm3": 1000.0,
+                "area_mm2": 600.0,
+                "mass_g": 7.85,
+                "density_g_cm3": 0.00785,
+                "material": "Steel",
+                "bbox_mm": {
+                    "min": [0.0, 0.0, 0.0],
+                    "max": [10.0, 10.0, 10.0],
+                    "size": [10.0, 10.0, 10.0],
+                    "center": [5.0, 5.0, 5.0],
+                },
+            }
+        ]
+        if include_bodies
+        else []
+    )
+    return {
+        "document": {
+            "name": "MockDesign",
+            "is_modified": True,
+            "is_saved": False,
+            "design_type": "parametric",
+        },
+        "counts": {
+            "bodies": len(bodies) if include_bodies else None,
+            "sketches": 1,
+            "components": 1,
+            "joints": 1,
+            "parameters": 2,
+            "timeline": 3,
+        },
+        "bodies": bodies,
+        "parameters": [
+            {
+                "name": "width",
+                "expression": "10 mm",
+                "unit": "mm",
+                "value_internal": 1.0,
+                "comment": None,
+            },
+            {
+                "name": "travel_full",
+                "expression": "58 mm",
+                "unit": "mm",
+                "value_internal": 5.8,
+                "comment": "Fully deployed travel",
+            },
+        ],
+        "joints": [
+            {
+                "name": "CarriageSlide",
+                "type": "slider",
+                "is_suppressed": False,
+                "is_light_bulb_on": True,
+                "value_mm": 0.0,
+                "limits_mm": {
+                    "min_enabled": True,
+                    "min": 0.0,
+                    "max_enabled": True,
+                    "max": 58.0,
+                    "rest_enabled": False,
+                    "rest": 0.0,
+                },
+            }
+        ],
+        "timeline": {"count": 3, "problems": [], "has_problems": False},
+    }
+
+
+def _fusion_params(p: dict) -> dict:
+    to_set = p.get("set") or {}
+    applied = []
+    for name, value in to_set.items():
+        expr = value if isinstance(value, str) else f"{value} mm"
+        applied.append(
+            {
+                "name": name,
+                "requested": value,
+                "expression_before": "0 mm",
+                "expression_after": expr,
+                "value_internal_before": 0.0,
+                "value_internal_after": 1.0,
+            }
+        )
+    names = p.get("get")
+    if names is None:
+        names = [a["name"] for a in applied] or ["width"]
+    if isinstance(names, str):
+        names = [names]
+    return {
+        "set_count": len(applied),
+        "get_count": len(names),
+        "applied": applied,
+        "parameters": [
+            {
+                "name": n,
+                "expression": "10 mm",
+                "unit": "mm",
+                "value_internal": 1.0,
+                "comment": None,
+            }
+            for n in names
+        ],
+    }
+
+
+def _fusion_drive_joint(p: dict) -> dict:
+    name = p.get("joint_name", "Joint1")
+    value = float(p.get("value", 0))
+    state = {
+        "name": name,
+        "type": "slider",
+        "is_suppressed": False,
+        "is_light_bulb_on": True,
+        "value_mm": value,
+        "limits_mm": {
+            "min_enabled": True,
+            "min": 0.0,
+            "max_enabled": True,
+            "max": 58.0,
+            "rest_enabled": False,
+            "rest": 0.0,
+        },
+    }
+    return {
+        "joint": name,
+        "type": "slider",
+        "unit": "mm",
+        "requested": value,
+        "actual": value,
+        "clamped": False,
+        "out_of_range": None,
+        "before": dict(state, value_mm=0.0),
+        "after": state,
+    }
+
+
+def _fusion_check_interference(p: dict) -> dict:
+    bodies = p.get("bodies")
+    return {
+        "clean": True,
+        "count": 0,
+        "bodies_checked": list(bodies) if bodies else ["Body1", "Body2"],
+        "requested": list(bodies) if bodies else None,
+        "include_coincident_faces": bool(p.get("include_coincident_faces", False)),
+        "interferences": [],
+    }
+
+
+def _fusion_rebuild(p: dict) -> dict:
+    path = p.get("script_path", "/tmp/mock_design.py")
+    return {
+        "script": path,
+        "source_bytes": 1234,
+        "elapsed_s": 0.42,
+        "returned": None,
+        "output": "",
+        "bodies": 1,
+        "sketches": 1,
+        "components": 1,
+        "timeline": 3,
+    }
+
+
+def _fusion_reset(p: dict) -> dict:
+    return {
+        "document": "MockDesign",
+        "was_owned": True,
+        "forced": bool(p.get("force", False)),
+        "deleted": {
+            "timeline": 3,
+            "bodies": 1,
+            "sketches": 1,
+            "occurrences": 0,
+            "parameters": 2,
+            "construction": 0,
+        },
+        "remaining": {
+            "bodies": 0,
+            "sketches": 0,
+            "occurrences": 0,
+            "parameters": 0,
+            "timeline": 0,
+        },
+        "clean": True,
+        "errors": [],
+        "documents_untouched": 1,
+    }
+
+
+def _fusion_export(p: dict) -> dict:
+    path = p.get("path", "/tmp/mock.step")
+    # Order matters and must match the handler: infer from the extension
+    # first, THEN normalise aliases. Aliasing first misses "/tmp/a.stp".
+    fmt = (p.get("format") or "").lower().lstrip(".")
+    if not fmt:
+        fmt = path.rsplit(".", 1)[-1].lower() if "." in path else "step"
+    if fmt == "stp":
+        fmt = "step"
+    return {
+        "exported": True,
+        "format": fmt,
+        "path": path,
+        "bytes": 4096,
+        "target": p.get("body_name") or "RootComponent",
+        "scope": "body" if p.get("body_name") else "design",
+    }
+
+
+def _fusion_execute(p: dict) -> dict:
+    return {
+        "executed": True,
+        "code": p.get("script", ""),
+        "result": "None",
+        "output": "",
+    }
+
+
 # ── default fallback ─────────────────────────────────────────────────
 
 
@@ -1024,4 +1284,14 @@ _DISPATCH: dict[str, Any] = {
     "set_design_type": _set_design_type,
     # perception
     "render_view": _render_view,
+    # agent-facing tools
+    "fusion_screenshot": _fusion_screenshot,
+    "fusion_inspect": _fusion_inspect,
+    "fusion_params": _fusion_params,
+    "fusion_drive_joint": _fusion_drive_joint,
+    "fusion_check_interference": _fusion_check_interference,
+    "fusion_rebuild": _fusion_rebuild,
+    "fusion_reset": _fusion_reset,
+    "fusion_export": _fusion_export,
+    "fusion_execute": _fusion_execute,
 }

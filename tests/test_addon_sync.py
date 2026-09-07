@@ -86,3 +86,61 @@ def test_mutation_sets_in_sync():
         f"  only in addon: {sorted(addon_set - mock_set)}\n"
         f"  only in mock:  {sorted(mock_set - addon_set)}"
     )
+
+
+def _extract_dispatch_keys(path: Path) -> set[str]:
+    """Pull the command names out of ``CommandHandler._COMMANDS``.
+
+    The table is built inside ``execute_command`` as a dict literal assigned
+    to ``self.__class__._COMMANDS``, so it has to come out via AST rather than
+    by importing (the addon needs Fusion's ``adsk`` runtime).
+    """
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == "_COMMANDS"
+                and isinstance(node.value, ast.Dict)
+            ):
+                return {
+                    k.value
+                    for k in node.value.keys
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                }
+    raise AssertionError(f"CommandHandler._COMMANDS dict not found in {path}")
+
+
+def test_every_tool_has_an_addon_handler():
+    """Every MCP tool must map to a command the add-in can actually dispatch.
+
+    Without this, adding a tool definition and forgetting the handler passes
+    every test and only fails against live Fusion, as 'Unknown command'.
+    """
+    from fusion360_mcp.tools import TOOLS
+
+    dispatch = _extract_dispatch_keys(
+        REPO_ROOT / "addon" / "server" / "command_handler.py"
+    )
+    # ping is answered by the EventBridge fast path, never reaching dispatch.
+    tool_names = {t["name"] for t in TOOLS} - {"ping"}
+    missing = tool_names - dispatch
+    assert not missing, (
+        f"Tools declared in tools.py with no handler in the add-in: "
+        f"{sorted(missing)}"
+    )
+
+
+def test_every_tool_has_a_real_mock():
+    """--mode mock must not fall through to the placeholder for any tool."""
+    from fusion360_mcp.mock import _DISPATCH
+    from fusion360_mcp.tools import TOOLS
+
+    tool_names = {t["name"] for t in TOOLS}
+    missing = sorted(n for n in tool_names if n not in _DISPATCH)
+    assert not missing, (
+        f"Tools with no mock handler (mock mode would return the "
+        f"'no mock handler' placeholder): {missing}"
+    )

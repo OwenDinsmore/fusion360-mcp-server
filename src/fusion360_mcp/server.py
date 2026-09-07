@@ -50,6 +50,7 @@ _SPECIAL_KEYS = {
     "traceback",
     "deltas",
     "image_base64",
+    "images",
 }
 
 
@@ -123,17 +124,38 @@ def _format_result(
         types.TextContent(type="text", text="\n".join(lines)),
     ]
 
-    # render_view: attach the PNG as an image block so vision models can see it.
+    # Attach PNGs as image blocks so vision models can actually see them.
+    # render_view returns one image at the top level; fusion_screenshot
+    # returns several under "images", in the order they were requested.
+    def _image_block(b64: str, fmt: str) -> types.ImageContent:
+        return types.ImageContent(
+            type="image",
+            data=b64,
+            mimeType=f"image/{fmt}",
+        )
+
     image_b64 = result.get("image_base64")
     if isinstance(image_b64, str) and image_b64:
-        img_format = result.get("image_format", "png")
         content.append(
-            types.ImageContent(
-                type="image",
-                data=image_b64,
-                mimeType=f"image/{img_format}",
-            )
+            _image_block(image_b64, result.get("image_format", "png"))
         )
+
+    images = result.get("images")
+    if isinstance(images, list):
+        for img in images:
+            if not isinstance(img, dict):
+                continue
+            b64 = img.get("image_base64")
+            if not isinstance(b64, str) or not b64:
+                continue
+            # Label each shot so the view is identifiable in the transcript.
+            view = img.get("view")
+            if view:
+                content.append(
+                    types.TextContent(type="text", text=f"view: {view}")
+                )
+            content.append(_image_block(b64, img.get("image_format", "png")))
+
     return content
 
 

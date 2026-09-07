@@ -11,6 +11,7 @@ import base64
 import io
 import math
 import os
+import sys
 import tempfile
 import time
 import traceback
@@ -102,6 +103,12 @@ class CommandHandler:
             # parametric & agent-authored changes
             "set_parameter",
             "execute_code",
+            # agent-facing tools that change geometry
+            "fusion_params",
+            "fusion_drive_joint",
+            "fusion_rebuild",
+            "fusion_reset",
+            "fusion_execute",
         }
     )
 
@@ -200,6 +207,16 @@ class CommandHandler:
                 "unfold": self.unfold,
                 # code execution
                 "execute_code": self.execute_code,
+                # agent-facing tools
+                "fusion_screenshot": self.fusion_screenshot,
+                "fusion_inspect": self.fusion_inspect,
+                "fusion_params": self.fusion_params,
+                "fusion_drive_joint": self.fusion_drive_joint,
+                "fusion_check_interference": self.fusion_check_interference,
+                "fusion_rebuild": self.fusion_rebuild,
+                "fusion_reset": self.fusion_reset,
+                "fusion_export": self.fusion_export,
+                "fusion_execute": self.fusion_execute,
                 # CAM
                 "cam_list_setups": self.cam_list_setups,
                 "cam_list_operations": self.cam_list_operations,
@@ -2410,17 +2427,25 @@ class CommandHandler:
         if bodies.count < 2:
             raise RuntimeError("Need at least 2 components with bodies")
 
-        interference = root.interfere(bodies, include_coincident_faces)
+        # Component.interfere() does not exist; interference analysis is a
+        # Design-level API.  Prefer fusion_check_interference, which works on
+        # bodies and defaults to the whole design.
+        design = self._design()
+        inp = design.createInterferenceInput(bodies)
+        inp.areCoincidentFacesIncluded = bool(include_coincident_faces)
+        interference = design.analyzeInterference(inp)
+
         results = []
-        for i in range(interference.interferenceResultCount):
-            result = interference.interferenceResult(i)
-            results.append(
-                {
-                    "body_one": result.entityOne.name,
-                    "body_two": result.entityTwo.name,
-                    "volume": result.interferenceBody.volume,
-                }
-            )
+        if interference is not None:
+            for i in range(interference.count):
+                result = interference.item(i)
+                results.append(
+                    {
+                        "body_one": result.entityOne.name,
+                        "body_two": result.entityTwo.name,
+                        "volume": result.interferenceBody.volume,
+                    }
+                )
 
         return {"interferences": results, "count": len(results)}
 
@@ -3270,3 +3295,841 @@ class CommandHandler:
         cam.upVector = up
         cam.isSmoothTransition = False
         viewport.camera = cam
+
+    # ==================================================================
+    # Agent-facing tools (fusion_*)
+    #
+    # Conventions for everything below:
+    #   * millimetres in, millimetres out.  Fusion's API is centimetres;
+    #     the conversion is confined to _mm()/_cm() so no caller has to
+    #     remember it.  Every numeric key carries its unit in its name.
+    #   * structured dicts, never prose.
+    #   * failures raise.  execute_command turns the exception into
+    #     ok:False + error_kind + the verbatim Fusion message + traceback.
+    #     Nothing here catches an API error just to keep going.
+    # ==================================================================
+
+    _MCP_ATTR_GROUP = "mcp_fusion"
+
+    @staticmethod
+    def _mm(cm_value):
+        """Fusion-internal cm -> mm."""
+        return cm_value * 10.0
+
+    @staticmethod
+    def _cm(mm_value):
+        """mm -> Fusion-internal cm."""
+        return mm_value / 10.0
+
+    def _bbox_mm(self, bbox):
+        if bbox is None:
+            return None
+        mn = [self._mm(v) for v in (bbox.minPoint.x, bbox.minPoint.y, bbox.minPoint.z)]
+        mx = [self._mm(v) for v in (bbox.maxPoint.x, bbox.maxPoint.y, bbox.maxPoint.z)]
+        return {
+            "min": mn,
+            "max": mx,
+            "size": [mx[i] - mn[i] for i in range(3)],
+            "center": [(mn[i] + mx[i]) / 2.0 for i in range(3)],
+        }
+
+    def _all_bodies(self):
+        """Every solid body in the design, root-level and inside components."""
+        root = self._root()
+        found = []
+        for i in range(root.bRepBodies.count):
+            found.append((root.bRepBodies.item(i), root.name))
+        for occ in root.allOccurrences:
+            for i in range(occ.bRepBodies.count):
+                found.append((occ.bRepBodies.item(i), occ.component.name))
+        return found
+
+    def _all_joints(self):
+        """Joints from the root component plus every occurrence."""
+        root = self._root()
+        found = []
+        seen = []
+        for i in range(root.joints.count):
+            j = root.joints.item(i)
+            found.append(j)
+            seen.append(j.entityToken)
+        for occ in root.allOccurrences:
+            comp = occ.component
+            for i in range(comp.joints.count):
+                j = comp.joints.item(i)
+                if j.entityToken not in seen:
+                    found.append(j)
+                    seen.append(j.entityToken)
+        return found
+
+    # ── fusion_screenshot ──────────────────────────────────────────────
+
+    def fusion_screenshot(
+        self,
+        views=None,
+        shaded: bool = True,
+        width: int = 1024,
+        height: int = 768,
+        fit: bool = True,
+    ):
+        """Capture several named views in one call.  See the tool docstring."""
+        if views is None:
+            views = ["iso"]
+        if isinstance(views, str):
+            views = [views]
+        if not views:
+            raise RuntimeError("views must not be empty")
+
+        valid = set(self._VIEW_DIRS) | {"current"}
+        unknown = [v for v in views if v not in valid]
+        if unknown:
+            # Fail before disturbing the camera, not halfway through.
+            raise RuntimeError(
+                f"Unknown view(s): {unknown}. "
+                f"Valid: current, {', '.join(sorted(self._VIEW_DIRS))}"
+            )
+
+        viewport = self.app.activeViewport
+        if viewport is None:
+            raise RuntimeError("No active viewport")
+
+        cam = viewport.camera
+        orig = {
+            "eye": (cam.eye.x, cam.eye.y, cam.eye.z),
+            "target": (cam.target.x, cam.target.y, cam.target.z),
+            "up": (cam.upVector.x, cam.upVector.y, cam.upVector.z),
+            "type": cam.cameraType,
+        }
+        orig_style = None
+        try:
+            orig_style = viewport.visualStyle
+        except Exception:
+            pass
+
+        images = []
+        try:
+            if orig_style is not None:
+                viewport.visualStyle = (
+                    adsk.core.VisualStyles.ShadedWithVisibleEdgesOnlyVisualStyle
+                    if shaded
+                    else adsk.core.VisualStyles.WireframeVisualStyle
+                )
+
+            for view in views:
+                if view != "current":
+                    self._orient_camera(viewport, self._VIEW_DIRS[view])
+                if fit:
+                    try:
+                        viewport.fit()
+                    except Exception:
+                        pass  # fit() fails on an empty design; the shot is still valid
+                adsk.doEvents()
+
+                fd, path = tempfile.mkstemp(suffix=".png", prefix="fusion_shot_")
+                os.close(fd)
+                try:
+                    # saveAsImageFile, not saveAsImageFileWithOptions: the
+                    # latter is unavailable on some builds and silently
+                    # returns false on others.
+                    ok = viewport.saveAsImageFile(path, int(width), int(height))
+                    if not ok or not os.path.exists(path):
+                        raise RuntimeError(
+                            f"saveAsImageFile returned false for view '{view}'"
+                        )
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                finally:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+
+                images.append(
+                    {
+                        "view": view,
+                        "width": int(width),
+                        "height": int(height),
+                        "image_format": "png",
+                        "image_base64": base64.b64encode(data).decode("ascii"),
+                        "bytes": len(data),
+                    }
+                )
+        finally:
+            if orig_style is not None:
+                try:
+                    viewport.visualStyle = orig_style
+                except Exception:
+                    pass
+            c = viewport.camera
+            c.isSmoothTransition = False
+            c.cameraType = orig["type"]
+            c.eye = adsk.core.Point3D.create(*orig["eye"])
+            c.target = adsk.core.Point3D.create(*orig["target"])
+            c.upVector = adsk.core.Vector3D.create(*orig["up"])
+            viewport.camera = c
+
+        return {
+            "count": len(images),
+            "views": [i["view"] for i in images],
+            "shaded": bool(shaded),
+            "total_bytes": sum(i["bytes"] for i in images),
+            "images": images,
+        }
+
+    # ── fusion_inspect ─────────────────────────────────────────────────
+
+    def fusion_inspect(self, include_bodies: bool = True):
+        """Numeric state of the design.  See the tool docstring."""
+        design = self._design()
+        root = self._root()
+        doc = design.parentDocument
+
+        bodies = []
+        if include_bodies:
+            for body, comp_name in self._all_bodies():
+                entry = {
+                    "name": body.name,
+                    "component": comp_name,
+                    "is_visible": body.isVisible,
+                    "volume_mm3": body.volume * 1000.0,  # cm^3 -> mm^3
+                    "area_mm2": body.area * 100.0,  # cm^2 -> mm^2
+                    "material": body.material.name if body.material else None,
+                    "bbox_mm": self._bbox_mm(body.boundingBox),
+                }
+                try:
+                    pp = body.physicalProperties
+                    entry["mass_g"] = pp.mass * 1000.0  # kg -> g
+                    entry["density_g_cm3"] = pp.density
+                except Exception as exc:
+                    # Report rather than hide: a body with no material has no mass.
+                    entry["mass_g"] = None
+                    entry["mass_error"] = f"{type(exc).__name__}: {exc}"
+                bodies.append(entry)
+
+        parameters = []
+        ups = design.userParameters
+        for i in range(ups.count):
+            p = ups.item(i)
+            parameters.append(
+                {
+                    "name": p.name,
+                    "expression": p.expression,
+                    "unit": p.unit,
+                    "value_internal": p.value,
+                    "comment": p.comment or None,
+                }
+            )
+
+        joints = []
+        for j in self._all_joints():
+            joints.append(self._joint_state(j))
+
+        timeline_problems = []
+        tl = getattr(design, "timeline", None)
+        tl_count = 0
+        if tl is not None:
+            tl_count = tl.count
+            healthy = adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState
+            suppressed = adsk.fusion.FeatureHealthStates.SuppressedFeatureHealthState
+            warning = adsk.fusion.FeatureHealthStates.WarningFeatureHealthState
+            for i in range(tl.count):
+                item = tl.item(i)
+                try:
+                    state = item.healthState
+                except Exception:
+                    continue
+                if state in (healthy, suppressed):
+                    continue
+                timeline_problems.append(
+                    {
+                        "index": i,
+                        "name": item.name,
+                        "severity": "warning" if state == warning else "error",
+                        "message": item.errorOrWarningMessage or "",
+                    }
+                )
+
+        return {
+            "document": {
+                "name": doc.name if doc else None,
+                "is_modified": doc.isModified if doc else None,
+                "is_saved": doc.isSaved if doc else None,
+                "design_type": (
+                    "parametric"
+                    if design.designType
+                    == adsk.fusion.DesignTypes.ParametricDesignType
+                    else "direct"
+                ),
+            },
+            "counts": {
+                "bodies": len(bodies) if include_bodies else None,
+                "sketches": root.sketches.count,
+                "components": root.allOccurrences.count,
+                "joints": len(joints),
+                "parameters": len(parameters),
+                "timeline": tl_count,
+            },
+            "bodies": bodies,
+            "parameters": parameters,
+            "joints": joints,
+            "timeline": {
+                "count": tl_count,
+                "problems": timeline_problems,
+                "has_problems": bool(timeline_problems),
+            },
+        }
+
+    def _joint_state(self, joint):
+        """Type, current value and limits for one joint, in mm / degrees."""
+        type_names = {
+            adsk.fusion.JointTypes.RigidJointType: "rigid",
+            adsk.fusion.JointTypes.RevoluteJointType: "revolute",
+            adsk.fusion.JointTypes.SliderJointType: "slider",
+            adsk.fusion.JointTypes.CylindricalJointType: "cylindrical",
+            adsk.fusion.JointTypes.PinSlotJointType: "pin_slot",
+            adsk.fusion.JointTypes.PlanarJointType: "planar",
+            adsk.fusion.JointTypes.BallJointType: "ball",
+        }
+        motion = joint.jointMotion
+        jt = motion.jointType
+        entry = {
+            "name": joint.name,
+            "type": type_names.get(jt, f"unknown({jt})"),
+            "is_suppressed": joint.isSuppressed,
+            "is_light_bulb_on": joint.isLightBulbOn,
+        }
+
+        def limits(lim, to_display):
+            if lim is None:
+                return None
+            return {
+                "min_enabled": lim.isMinimumValueEnabled,
+                "min": to_display(lim.minimumValue),
+                "max_enabled": lim.isMaximumValueEnabled,
+                "max": to_display(lim.maximumValue),
+                "rest_enabled": lim.isRestValueEnabled,
+                "rest": to_display(lim.restValue),
+            }
+
+        deg = math.degrees
+        if jt == adsk.fusion.JointTypes.SliderJointType:
+            entry["value_mm"] = self._mm(motion.slideValue)
+            entry["limits_mm"] = limits(motion.slideLimits, self._mm)
+        elif jt == adsk.fusion.JointTypes.RevoluteJointType:
+            entry["value_deg"] = deg(motion.rotationValue)
+            entry["limits_deg"] = limits(motion.rotationLimits, deg)
+        elif jt == adsk.fusion.JointTypes.CylindricalJointType:
+            entry["value_mm"] = self._mm(motion.slideValue)
+            entry["limits_mm"] = limits(motion.slideLimits, self._mm)
+            entry["value_deg"] = deg(motion.rotationValue)
+            entry["limits_deg"] = limits(motion.rotationLimits, deg)
+        elif jt == adsk.fusion.JointTypes.PinSlotJointType:
+            entry["value_mm"] = self._mm(motion.slideValue)
+            entry["limits_mm"] = limits(motion.slideLimits, self._mm)
+            entry["value_deg"] = deg(motion.rotationValue)
+            entry["limits_deg"] = limits(motion.rotationLimits, deg)
+        elif jt == adsk.fusion.JointTypes.RigidJointType:
+            entry["value_mm"] = None
+        return entry
+
+    # ── fusion_params ──────────────────────────────────────────────────
+
+    def fusion_params(self, get=None, set=None):
+        """Batch read/write of user parameters.  See the tool docstring."""
+        design = self._design()
+        ups = design.userParameters
+
+        def find(name):
+            p = ups.itemByName(name)
+            if p is None:
+                available = [ups.item(i).name for i in range(ups.count)]
+                raise RuntimeError(
+                    f"No user parameter named '{name}'. Available: {available}"
+                )
+            return p
+
+        def snapshot(p):
+            return {
+                "name": p.name,
+                "expression": p.expression,
+                "unit": p.unit,
+                "value_internal": p.value,
+                "comment": p.comment or None,
+            }
+
+        applied = []
+        if set:
+            if not isinstance(set, dict):
+                raise RuntimeError("set must be an object mapping name -> value")
+            for name, value in set.items():
+                p = find(name)
+                before = snapshot(p)
+                # A bare number is interpreted in the parameter's OWN unit,
+                # not in Fusion's internal cm.  Assigning p.value would treat
+                # 50 as 50cm on a millimetre parameter — the classic footgun.
+                if isinstance(value, str):
+                    new_expr = value
+                elif isinstance(value, (int, float)):
+                    new_expr = f"{value} {p.unit}".strip()
+                else:
+                    raise RuntimeError(
+                        f"Value for '{name}' must be a number or an expression "
+                        f"string, got {type(value).__name__}"
+                    )
+                try:
+                    p.expression = new_expr
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Fusion rejected expression {new_expr!r} for parameter "
+                        f"'{name}': {exc}"
+                    ) from exc
+                applied.append(
+                    {
+                        "name": name,
+                        "requested": value,
+                        "expression_before": before["expression"],
+                        "expression_after": p.expression,
+                        "value_internal_before": before["value_internal"],
+                        "value_internal_after": p.value,
+                    }
+                )
+
+        if get is None:
+            names = [ups.item(i).name for i in range(ups.count)] if not set else None
+            if names is None:
+                names = [a["name"] for a in applied]
+        elif isinstance(get, str):
+            names = [get]
+        else:
+            names = list(get)
+
+        read = [snapshot(find(n)) for n in names]
+
+        return {
+            "set_count": len(applied),
+            "get_count": len(read),
+            "applied": applied,
+            "parameters": read,
+        }
+
+    # ── fusion_drive_joint ─────────────────────────────────────────────
+
+    def fusion_drive_joint(self, joint_name: str, value: float):
+        """Drive one joint to a value.  See the tool docstring."""
+        joints = self._all_joints()
+        match = None
+        for j in joints:
+            if j.name == joint_name:
+                match = j
+                break
+        if match is None:
+            raise RuntimeError(
+                f"No joint named '{joint_name}'. "
+                f"Available: {[j.name for j in joints]}"
+            )
+
+        motion = match.jointMotion
+        jt = motion.jointType
+        before = self._joint_state(match)
+
+        if jt in (
+            adsk.fusion.JointTypes.SliderJointType,
+            adsk.fusion.JointTypes.CylindricalJointType,
+            adsk.fusion.JointTypes.PinSlotJointType,
+        ):
+            unit, attr, lim = "mm", "slideValue", motion.slideLimits
+            internal = self._cm(float(value))
+        elif jt == adsk.fusion.JointTypes.RevoluteJointType:
+            unit, attr, lim = "deg", "rotationValue", motion.rotationLimits
+            internal = math.radians(float(value))
+        else:
+            raise RuntimeError(
+                f"Joint '{joint_name}' is a "
+                f"{before['type']} joint and has no single drivable value"
+            )
+
+        # Warn rather than refuse: Fusion itself clamps, and a caller sweeping
+        # a range wants to know it hit the stop, not get an exception.
+        out_of_range = None
+        if lim is not None:
+            lo = lim.minimumValue if lim.isMinimumValueEnabled else None
+            hi = lim.maximumValue if lim.isMaximumValueEnabled else None
+            if lo is not None and internal < lo - 1e-9:
+                out_of_range = "below_minimum"
+            elif hi is not None and internal > hi + 1e-9:
+                out_of_range = "above_maximum"
+
+        try:
+            setattr(motion, attr, internal)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Fusion rejected {attr}={internal} on joint '{joint_name}': {exc}"
+            ) from exc
+
+        adsk.doEvents()
+        after = self._joint_state(match)
+        key = f"value_{unit}"
+        actual = after.get(key)
+        return {
+            "joint": joint_name,
+            "type": before["type"],
+            "unit": unit,
+            "requested": float(value),
+            "actual": actual,
+            "clamped": (
+                actual is not None and abs(actual - float(value)) > 1e-6
+            ),
+            "out_of_range": out_of_range,
+            "before": before,
+            "after": after,
+        }
+
+    # ── fusion_check_interference ──────────────────────────────────────
+
+    def fusion_check_interference(
+        self, bodies=None, include_coincident_faces: bool = False
+    ):
+        """Interference analysis over bodies.  See the tool docstring."""
+        available = self._all_bodies()
+
+        if bodies is None:
+            chosen = [b for b, _ in available]
+            requested = None
+        else:
+            if isinstance(bodies, str):
+                bodies = [bodies]
+            requested = list(bodies)
+            by_name = {}
+            for b, _ in available:
+                by_name.setdefault(b.name, b)
+            missing = [n for n in requested if n not in by_name]
+            if missing:
+                raise RuntimeError(
+                    f"Body/bodies not found: {missing}. "
+                    f"Available: {sorted(by_name)}"
+                )
+            chosen = [by_name[n] for n in requested]
+
+        if len(chosen) < 2:
+            raise RuntimeError(
+                f"Interference analysis needs at least 2 bodies, got "
+                f"{len(chosen)}"
+                + (f" ({[b.name for b in chosen]})" if chosen else "")
+            )
+
+        collection = adsk.core.ObjectCollection.create()
+        for b in chosen:
+            collection.add(b)
+
+        # createInterferenceInput / analyzeInterference are Design methods.
+        # Component has neither, and Component.interfere() does not exist at
+        # all on this Fusion build despite appearing in older samples.
+        design = self._design()
+        inp = design.createInterferenceInput(collection)
+        inp.areCoincidentFacesIncluded = bool(include_coincident_faces)
+        results = design.analyzeInterference(inp)
+
+        pairs = []
+        if results is not None:
+            for i in range(results.count):
+                r = results.item(i)
+                vol_cm3 = r.interferenceBody.volume
+                pairs.append(
+                    {
+                        "body_one": r.entityOne.name,
+                        "body_two": r.entityTwo.name,
+                        "overlap_volume_mm3": vol_cm3 * 1000.0,
+                        "bbox_mm": self._bbox_mm(r.interferenceBody.boundingBox),
+                    }
+                )
+
+        pairs.sort(key=lambda p: p["overlap_volume_mm3"], reverse=True)
+        return {
+            "clean": not pairs,
+            "count": len(pairs),
+            "bodies_checked": [b.name for b in chosen],
+            "requested": requested,
+            "include_coincident_faces": bool(include_coincident_faces),
+            "interferences": pairs,
+        }
+
+    # ── fusion_rebuild ─────────────────────────────────────────────────
+
+    def fusion_rebuild(self, script_path: str, args=None):
+        """Run a build script from disk as one call.  See the tool docstring."""
+        path = os.path.abspath(os.path.expanduser(script_path))
+        if not os.path.exists(path):
+            raise RuntimeError(
+                f"Build script not found: {path} "
+                f"(paths resolve on the machine running Fusion)"
+            )
+        if not os.path.isfile(path):
+            raise RuntimeError(f"Not a file: {path}")
+
+        with open(path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+
+        design = self._design()
+        ns = {
+            "adsk": adsk,
+            "app": self.app,
+            "ui": self.ui,
+            "design": design,
+            "component": self._root(),
+            "math": math,
+            "args": args or {},
+            "__file__": path,
+            "__name__": "__mcp_build__",
+        }
+
+        # The script's own directory goes on sys.path so a design can
+        # `from lib import fusionlib` without any packaging ceremony.
+        script_dir = os.path.dirname(path)
+        added_paths = []
+        for candidate in (script_dir, os.path.dirname(script_dir)):
+            if candidate and candidate not in sys.path:
+                sys.path.insert(0, candidate)
+                added_paths.append(candidate)
+
+        buf = io.StringIO()
+        t0 = time.monotonic()
+        try:
+            with redirect_stdout(buf):
+                exec(compile(source, path, "exec"), ns)
+                main = ns.get("build") or ns.get("main")
+                returned = main(**(args or {})) if callable(main) else None
+        except Exception as exc:
+            # Surface the script's own traceback, not the bridge's.
+            raise RuntimeError(
+                f"{type(exc).__name__} in {os.path.basename(path)}: {exc}\n"
+                f"{traceback.format_exc()}\n"
+                f"--- script output before failure ---\n{buf.getvalue()}"
+            ) from exc
+        finally:
+            for p in added_paths:
+                try:
+                    sys.path.remove(p)
+                except ValueError:
+                    pass
+
+        elapsed = time.monotonic() - t0
+        root = self._root()
+        if returned is not None:
+            try:
+                import json as _json
+
+                _json.dumps(returned)
+            except (TypeError, ValueError):
+                returned = str(returned)
+
+        return {
+            "script": path,
+            "source_bytes": len(source),
+            "elapsed_s": round(elapsed, 3),
+            "returned": returned,
+            "output": buf.getvalue(),
+            "bodies": sum(1 for _ in self._all_bodies()),
+            "sketches": root.sketches.count,
+            "components": root.allOccurrences.count,
+            "timeline": design.timeline.count if hasattr(design, "timeline") else 0,
+        }
+
+    # ── fusion_reset ───────────────────────────────────────────────────
+
+    def fusion_reset(self, confirm: bool = True, force: bool = False):
+        """Wipe the active document only.  See the tool docstring."""
+        if confirm is not True:
+            raise RuntimeError("fusion_reset requires confirm=true")
+
+        doc = self.app.activeDocument
+        if doc is None:
+            raise RuntimeError("No active document")
+        design = self._design()
+        if design.parentDocument.name != doc.name:
+            raise RuntimeError(
+                "Active document and active design disagree — refusing to wipe"
+            )
+
+        root = design.rootComponent
+        owned = (
+            root.attributes.itemByName(self._MCP_ATTR_GROUP, "owned_by") is not None
+        )
+        docs_before = self.app.documents.count
+
+        if doc.isModified and not owned and not force:
+            raise RuntimeError(
+                f"Refusing to reset '{doc.name}': it has unsaved changes that "
+                f"this tool did not make. Save it, close it, or call again "
+                f"with force=true if you are certain the changes are "
+                f"disposable."
+            )
+
+        deleted = {"timeline": 0, "bodies": 0, "sketches": 0,
+                   "occurrences": 0, "parameters": 0, "construction": 0}
+        errors = []
+
+        def attempt(stage, name, fn):
+            try:
+                fn()
+                deleted[stage] += 1
+            except Exception as exc:
+                errors.append(
+                    {"stage": stage, "name": name,
+                     "error": f"{type(exc).__name__}: {exc}"}
+                )
+
+        tl = getattr(design, "timeline", None)
+        if tl is not None:
+            for i in range(tl.count - 1, -1, -1):
+                try:
+                    item = tl.item(i)
+                    nm, ent = item.name, item.entity
+                except Exception as exc:
+                    errors.append({"stage": "timeline", "name": f"#{i}",
+                                   "error": f"{type(exc).__name__}: {exc}"})
+                    continue
+                if ent is None:
+                    errors.append({"stage": "timeline", "name": nm,
+                                   "error": "timeline item exposes no entity"})
+                    continue
+                attempt("timeline", nm, ent.deleteMe)
+
+        for i in range(root.bRepBodies.count - 1, -1, -1):
+            b = root.bRepBodies.item(i)
+            attempt("bodies", b.name, b.deleteMe)
+        for i in range(root.sketches.count - 1, -1, -1):
+            s = root.sketches.item(i)
+            attempt("sketches", s.name, s.deleteMe)
+        for i in range(root.occurrences.count - 1, -1, -1):
+            o = root.occurrences.item(i)
+            attempt("occurrences", o.name, o.deleteMe)
+        for coll in (root.constructionPlanes, root.constructionAxes,
+                     root.constructionPoints):
+            for i in range(coll.count - 1, -1, -1):
+                c = coll.item(i)
+                attempt("construction", c.name, c.deleteMe)
+
+        ups = design.userParameters
+        for i in range(ups.count - 1, -1, -1):
+            p = ups.item(i)
+            attempt("parameters", p.name, p.deleteMe)
+
+        # Claim the document so a later reset does not have to ask again.
+        try:
+            root.attributes.add(
+                self._MCP_ATTR_GROUP, "owned_by",
+                f"fusion_reset@{time.strftime('%Y-%m-%dT%H:%M:%S')}",
+            )
+        except Exception as exc:
+            errors.append({"stage": "marker", "name": "owned_by",
+                           "error": f"{type(exc).__name__}: {exc}"})
+
+        remaining = {
+            "bodies": root.bRepBodies.count,
+            "sketches": root.sketches.count,
+            "occurrences": root.occurrences.count,
+            "parameters": design.userParameters.count,
+            "timeline": tl.count if tl is not None else 0,
+        }
+        docs_after = self.app.documents.count
+        if docs_after != docs_before:
+            raise RuntimeError(
+                f"Document count changed during reset "
+                f"({docs_before} -> {docs_after}) — this tool must only "
+                f"affect the active document"
+            )
+
+        return {
+            "document": doc.name,
+            "was_owned": owned,
+            "forced": bool(force),
+            "deleted": deleted,
+            "remaining": remaining,
+            "clean": not any(remaining.values()),
+            "errors": errors,
+            "documents_untouched": docs_before,
+        }
+
+    # ── fusion_export ──────────────────────────────────────────────────
+
+    _EXPORT_FORMATS = ("step", "stl", "3mf")
+
+    def fusion_export(self, format: str = None, path: str = None,
+                      body_name: str = None):
+        """Export geometry to STEP/STL/3MF.  See the tool docstring."""
+        if not path:
+            raise RuntimeError("path is required")
+        out = os.path.abspath(os.path.expanduser(path))
+
+        fmt = (format or "").lower().lstrip(".")
+        if not fmt:
+            fmt = os.path.splitext(out)[1].lower().lstrip(".")
+        if fmt in ("stp",):
+            fmt = "step"
+        if fmt not in self._EXPORT_FORMATS:
+            raise RuntimeError(
+                f"Unsupported format {format!r}. "
+                f"Supported: {', '.join(self._EXPORT_FORMATS)}"
+            )
+
+        parent = os.path.dirname(out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        design = self._design()
+        em = design.exportManager
+
+        if body_name:
+            geometry = self._body_by_name(body_name)
+            target = body_name
+        else:
+            geometry = design.rootComponent
+            target = design.rootComponent.name
+            if fmt == "step":
+                geometry = None  # STEP of the whole design takes no geometry arg
+
+        if fmt == "step":
+            opts = (
+                em.createSTEPExportOptions(out, geometry)
+                if geometry is not None
+                else em.createSTEPExportOptions(out)
+            )
+        elif fmt == "stl":
+            opts = em.createSTLExportOptions(geometry, out)
+            opts.meshRefinement = (
+                adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+            )
+        else:  # 3mf
+            opts = em.createC3MFExportOptions(geometry, out)
+            opts.meshRefinement = (
+                adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+            )
+
+        ok = em.execute(opts)
+        if not ok:
+            raise RuntimeError(
+                f"ExportManager.execute returned false for {fmt} -> {out}"
+            )
+        if not os.path.exists(out):
+            raise RuntimeError(
+                f"Export reported success but no file exists at {out}"
+            )
+
+        size = os.path.getsize(out)
+        if size == 0:
+            raise RuntimeError(f"Export produced an empty file at {out}")
+
+        return {
+            "exported": True,
+            "format": fmt,
+            "path": out,
+            "bytes": size,
+            "target": target,
+            "scope": "body" if body_name else "design",
+        }
+
+    # ── fusion_execute ─────────────────────────────────────────────────
+
+    def fusion_execute(self, script: str):
+        """Escape hatch — same engine as execute_code."""
+        return self.execute_code(script)

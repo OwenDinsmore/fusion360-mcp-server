@@ -2281,6 +2281,323 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ── agent-facing tools (fusion_*) ────────────────────────────────
+    {
+        "name": "fusion_screenshot",
+        "title": "Screenshot Views",
+        "description": (
+            "Capture one or more named views of the active design as PNG "
+            "images, in a SINGLE call. Prefer this over calling render_view "
+            "repeatedly: the camera is saved and restored once, so the user's "
+            "view is not disturbed between shots.\n\n"
+            "views: list of view names. Valid: iso, iso_ne, iso_nw, iso_sw, "
+            "front, back, top, bottom, left, right, current. Defaults to "
+            "[\"iso\"]. 'current' captures the camera as the user left it.\n"
+            "shaded: true (default) renders shaded with visible edges; false "
+            "renders wireframe, which is better for checking internal "
+            "structure and hidden pockets.\n"
+            "width/height: pixels per image, default 1024x768.\n"
+            "fit: zoom to fit the model before each capture (default true).\n\n"
+            "Returns the images plus a count and total byte size. Every image "
+            "is attached as an MCP image block, in the order requested.\n\n"
+            "For checking DIMENSIONS, use fusion_inspect instead — it is "
+            "cheaper and gives exact numbers. Use this to check SHAPE."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "views": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "iso", "iso_ne", "iso_nw", "iso_sw", "front",
+                            "back", "top", "bottom", "left", "right", "current",
+                        ],
+                    },
+                    "description": "Views to capture in one call",
+                },
+                "shaded": {
+                    "type": "boolean",
+                    "description": "Shaded with edges (true) or wireframe (false)",
+                },
+                "width": {"type": "integer", "description": "Pixels wide"},
+                "height": {"type": "integer", "description": "Pixels high"},
+                "fit": {"type": "boolean", "description": "Fit model before capture"},
+            },
+        },
+    },
+    {
+        "name": "fusion_inspect",
+        "title": "Inspect Design",
+        "description": (
+            "Full numeric state of the active design as JSON. This is the "
+            "preferred way to verify a model — it is cheaper and exact, where "
+            "a screenshot is expensive and approximate. Reach for a "
+            "screenshot only when you need to judge SHAPE.\n\n"
+            "Returns:\n"
+            "  document   — name, is_modified, is_saved, design_type\n"
+            "  counts     — bodies, sketches, components, joints, parameters, "
+            "timeline\n"
+            "  bodies[]   — name, component, volume_mm3, area_mm2, mass_g, "
+            "material, bbox_mm {min,max,size,center}, is_visible\n"
+            "  parameters[] — name, expression (e.g. '58 mm'), unit, "
+            "value_internal (cm — Fusion's internal unit), comment\n"
+            "  joints[]   — name, type, current value in mm or degrees, and "
+            "limits {min,max,rest} with their enabled flags\n"
+            "  timeline   — count plus problems[], each with index, name, "
+            "severity (error|warning) and Fusion's own message\n\n"
+            "ALL LENGTHS ARE MILLIMETRES except parameters.value_internal, "
+            "which is Fusion's raw centimetre value. Check timeline.has_problems "
+            "after any rebuild — a design can look right and still carry "
+            "errored features."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_bodies": {
+                    "type": "boolean",
+                    "description": (
+                        "Include the bodies array (default true). Set false "
+                        "for a fast parameter/joint-only read on a heavy design."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_params",
+        "title": "Get/Set Parameters",
+        "description": (
+            "Read and write user parameters in one call. This is the main "
+            "lever for parametric sweeps — set a driving dimension, then "
+            "inspect or screenshot the result.\n\n"
+            "set: object mapping parameter name to value. A NUMBER is "
+            "interpreted in that parameter's own unit, so {\"travel_full\": 58} "
+            "on a millimetre parameter means 58 mm, not 58 cm. A STRING is "
+            "passed to Fusion as an expression, so you can write \"58 mm\", "
+            "\"2 in\", or reference other parameters: \"panel_w + 2*clearance\".\n"
+            "get: list of names to read back. Omit to read every parameter "
+            "when no set is given, or just the ones you set otherwise.\n\n"
+            "Writes are applied before reads, so the returned values reflect "
+            "the new state. applied[] reports expression_before/after and "
+            "value_internal_before/after for each write, so you can confirm "
+            "Fusion accepted the expression you meant.\n\n"
+            "Fails loudly on an unknown parameter name and lists what exists. "
+            "Creating a parameter is create_parameter, not this tool."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "get": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Parameter names to read back",
+                },
+                "set": {
+                    "type": "object",
+                    "description": (
+                        "name -> number (in the parameter's own unit) or "
+                        "expression string"
+                    ),
+                    "additionalProperties": {
+                        "anyOf": [{"type": "number"}, {"type": "string"}]
+                    },
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_drive_joint",
+        "title": "Drive Joint",
+        "description": (
+            "Set a joint's value so motion can be verified without writing a "
+            "script. Use it to sweep a mechanism through its travel and check "
+            "for collisions at each stop with fusion_check_interference.\n\n"
+            "joint_name: the joint's name as shown by fusion_inspect.\n"
+            "value: MILLIMETRES for slider, cylindrical and pin-slot joints; "
+            "DEGREES for revolute joints. Rigid joints have no drivable value "
+            "and are rejected.\n\n"
+            "Returns requested vs actual, a clamped flag when Fusion pinned "
+            "the value to a limit, out_of_range (below_minimum / "
+            "above_maximum / null), and the full joint state before and after. "
+            "Driving past a limit is reported, not refused — a sweep wants to "
+            "know it hit the stop."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["joint_name", "value"],
+            "properties": {
+                "joint_name": {"type": "string", "description": "Joint name"},
+                "value": {
+                    "type": "number",
+                    "description": "mm for slider-type joints, degrees for revolute",
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_check_interference",
+        "title": "Check Interference",
+        "description": (
+            "Run Fusion's interference analysis and report colliding pairs "
+            "with their overlap volumes.\n\n"
+            "bodies: list of body names to check. Omit to check EVERY body in "
+            "the design, including bodies inside components. At least two "
+            "bodies must be in scope or the call fails.\n"
+            "include_coincident_faces: count touching faces as interference "
+            "(default false). Leave it false for fit checks — parts designed "
+            "to mate will touch by design.\n\n"
+            "Returns clean:true and an empty interferences[] when nothing "
+            "collides. Each interference gives body_one, body_two, "
+            "overlap_volume_mm3 and the overlap's bounding box in mm, sorted "
+            "largest overlap first. A tiny overlap volume usually means a "
+            "missing clearance, not a modelling error."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "bodies": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Body names; omit to check all bodies",
+                },
+                "include_coincident_faces": {
+                    "type": "boolean",
+                    "description": "Treat touching faces as interference",
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_rebuild",
+        "title": "Rebuild From Script",
+        "description": (
+            "Read a Python build script from disk and execute it inside "
+            "Fusion as one atomic call. This is the primary way to build "
+            "models: a design is a script that can be re-run, not a sequence "
+            "of interactive edits.\n\n"
+            "script_path: path to a .py file, resolved ON THE MACHINE RUNNING "
+            "FUSION. The script's directory and its parent are put on "
+            "sys.path for the duration, so a design under scripts/designs/ "
+            "can do 'from lib import fusionlib'.\n"
+            "args: optional object passed to the script as the global 'args', "
+            "and as keyword arguments if the script defines build() or "
+            "main().\n\n"
+            "The script runs with adsk, app, ui, design, component and math "
+            "already bound. If it defines build() or main(), that is called "
+            "after the module body. stdout is captured and returned.\n\n"
+            "Build scripts are expected to be idempotent: wipe first, then "
+            "rebuild from zero, so running twice gives an identical result. "
+            "On failure the script's own traceback and everything it printed "
+            "before dying are returned verbatim."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["script_path"],
+            "properties": {
+                "script_path": {
+                    "type": "string",
+                    "description": "Path to the .py build script on the Fusion host",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Passed to the script as 'args' / build(**args)",
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_reset",
+        "title": "Reset Document",
+        "description": (
+            "Wipe the ACTIVE document back to empty: timeline, bodies, "
+            "sketches, components, construction geometry and user parameters. "
+            "Other open documents are never touched, and the call fails if "
+            "the document count changes.\n\n"
+            "confirm: must be true. There is no default that destroys work.\n"
+            "force: override the unsaved-changes guard.\n\n"
+            "SAFETY: if the active document has unsaved modifications that "
+            "this tool did not make, the reset is REFUSED. Once it has wiped "
+            "a document it marks it as its own, so repeated rebuild cycles "
+            "run without prompting. That means the first reset of a document "
+            "you have been editing by hand will refuse — save it, close it, "
+            "or pass force=true if the changes really are disposable.\n\n"
+            "Returns per-stage delete counts, what remains, a clean flag, and "
+            "any per-item errors rather than silently ignoring them."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["confirm"],
+            "properties": {
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true; guards against accidental calls",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Bypass the unsaved-changes guard",
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_export",
+        "title": "Export Geometry",
+        "description": (
+            "Export the design or one body to STEP, STL or 3MF.\n\n"
+            "format: step | stl | 3mf. Omit to infer from the path's "
+            "extension. 'stp' is accepted as an alias for step.\n"
+            "path: output file path on the Fusion host. Parent directories "
+            "are created.\n"
+            "body_name: export just this body. Omit to export the whole "
+            "design.\n\n"
+            "STEP is the format to hand to another CAD package; STL and 3MF "
+            "go to a slicer, and both are meshed at high refinement. 3MF "
+            "carries units and colour where STL carries neither.\n\n"
+            "Verifies the file actually exists and is non-empty before "
+            "reporting success, and returns its size in bytes — Fusion's "
+            "export can report success and write nothing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "format": {
+                    "type": "string",
+                    "enum": ["step", "stp", "stl", "3mf"],
+                    "description": "Output format; inferred from path if omitted",
+                },
+                "path": {"type": "string", "description": "Output file path"},
+                "body_name": {
+                    "type": "string",
+                    "description": "Export only this body; omit for whole design",
+                },
+            },
+        },
+    },
+    {
+        "name": "fusion_execute",
+        "title": "Execute Python",
+        "description": (
+            "Escape hatch: run arbitrary Python inside Fusion with full "
+            "adsk.* access. Reach for a specific tool first — this one has no "
+            "schema to check your work against.\n\n"
+            "Bound names: adsk, app, ui, design, component, math. The value "
+            "of the last expression is returned; stdout is captured "
+            "separately. Exceptions come back with the full traceback.\n\n"
+            "For anything you will run more than once, put it in a file and "
+            "use fusion_rebuild instead — scripts are re-runnable and "
+            "reviewable, ad-hoc snippets are neither."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["script"],
+            "properties": {
+                "script": {"type": "string", "description": "Python source to run"},
+            },
+        },
+    },
 ]
 
 # ── tool annotations ──────────────────────────────────────────────────
@@ -2303,8 +2620,11 @@ _READ_ONLY = {
     "cam_get_operation_info",
     "get_design_type",
     "render_view",
+    "fusion_screenshot",
+    "fusion_inspect",
+    "fusion_check_interference",
 }
-_DESTRUCTIVE = {"delete_all", "delete_parameter"}
+_DESTRUCTIVE = {"delete_all", "delete_parameter", "fusion_reset"}
 _IDEMPOTENT = {
     "ping",
     "get_scene_info",
@@ -2325,6 +2645,12 @@ _IDEMPOTENT = {
     "set_design_type",
     "rename_body",
     "render_view",
+    "fusion_screenshot",
+    "fusion_inspect",
+    "fusion_check_interference",
+    "fusion_params",
+    "fusion_drive_joint",
+    "fusion_export",
 }
 
 for _t in TOOLS:

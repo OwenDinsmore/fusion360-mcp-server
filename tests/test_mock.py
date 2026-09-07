@@ -921,3 +921,159 @@ class TestMockFallback:
         assert "warning" in result
         assert result["mode"] == "mock"
         assert result["params_received"] == {"x": 1}
+
+
+class TestAgentFacingTools:
+    """Contracts for the fusion_* tools that agents drive directly."""
+
+    def test_screenshot_returns_one_image_per_view(self):
+        result = mock_command(
+            "fusion_screenshot", {"views": ["iso", "front", "top"]}
+        )
+        assert result["count"] == 3
+        assert result["views"] == ["iso", "front", "top"]
+        assert len(result["images"]) == 3
+        assert [i["view"] for i in result["images"]] == ["iso", "front", "top"]
+
+    def test_screenshot_defaults_to_iso(self):
+        result = mock_command("fusion_screenshot", {})
+        assert result["views"] == ["iso"]
+
+    def test_screenshot_images_decode_as_png(self):
+        import base64
+
+        result = mock_command("fusion_screenshot", {"views": ["iso", "front"]})
+        for img in result["images"]:
+            raw = base64.b64decode(img["image_base64"])
+            assert raw.startswith(b"\x89PNG\r\n\x1a\n")
+
+    def test_inspect_reports_millimetres_and_counts(self):
+        result = mock_command("fusion_inspect", {})
+        body = result["bodies"][0]
+        # Unit-suffixed keys are the contract; a bare "volume" would be ambiguous.
+        assert "volume_mm3" in body
+        assert "mass_g" in body
+        assert set(body["bbox_mm"]) == {"min", "max", "size", "center"}
+        assert set(result["counts"]) >= {
+            "bodies", "sketches", "components", "joints", "parameters", "timeline",
+        }
+
+    def test_inspect_exposes_timeline_health(self):
+        result = mock_command("fusion_inspect", {})
+        assert "has_problems" in result["timeline"]
+        assert isinstance(result["timeline"]["problems"], list)
+
+    def test_inspect_joint_carries_value_and_limits(self):
+        joint = mock_command("fusion_inspect", {})["joints"][0]
+        assert joint["type"] == "slider"
+        assert "value_mm" in joint
+        assert set(joint["limits_mm"]) >= {"min", "max", "min_enabled", "max_enabled"}
+
+    def test_params_reports_before_and_after_per_write(self):
+        result = mock_command("fusion_params", {"set": {"travel_full": 58}})
+        assert result["set_count"] == 1
+        applied = result["applied"][0]
+        assert applied["name"] == "travel_full"
+        assert applied["requested"] == 58
+        assert "expression_before" in applied and "expression_after" in applied
+
+    def test_params_get_only_writes_nothing(self):
+        result = mock_command("fusion_params", {"get": ["panel_w", "panel_h"]})
+        assert result["set_count"] == 0
+        assert result["get_count"] == 2
+
+    def test_drive_joint_reports_requested_versus_actual(self):
+        result = mock_command(
+            "fusion_drive_joint", {"joint_name": "CarriageSlide", "value": 25}
+        )
+        assert result["joint"] == "CarriageSlide"
+        assert result["unit"] == "mm"
+        assert result["requested"] == 25
+        assert "actual" in result and "clamped" in result
+        assert "out_of_range" in result
+
+    def test_check_interference_clean_means_empty_list(self):
+        result = mock_command("fusion_check_interference", {})
+        assert result["clean"] is True
+        assert result["interferences"] == []
+        assert result["count"] == 0
+
+    def test_export_infers_format_from_extension(self):
+        assert mock_command(
+            "fusion_export", {"path": "/tmp/part.3mf"}
+        )["format"] == "3mf"
+        assert mock_command(
+            "fusion_export", {"path": "/tmp/part.stp"}
+        )["format"] == "step"
+
+    def test_export_reports_scope(self):
+        whole = mock_command("fusion_export", {"path": "/tmp/a.step"})
+        one = mock_command(
+            "fusion_export", {"path": "/tmp/a.step", "body_name": "Body1"}
+        )
+        assert whole["scope"] == "design"
+        assert one["scope"] == "body"
+
+    def test_reset_reports_what_remains(self):
+        result = mock_command("fusion_reset", {"confirm": True})
+        assert result["clean"] is True
+        assert set(result["remaining"]) >= {"bodies", "sketches", "parameters"}
+        assert result["documents_untouched"] == 1
+
+    def test_rebuild_reports_timing_and_resulting_counts(self):
+        result = mock_command("fusion_rebuild", {"script_path": "/tmp/d.py"})
+        assert "elapsed_s" in result
+        assert set(result) >= {"script", "bodies", "sketches", "components"}
+
+
+class TestAgentToolSchemas:
+    """Schema-level guarantees the tool descriptions promise."""
+
+    def test_reset_requires_confirm(self):
+        from fusion360_mcp.tools import get_tool_by_name
+
+        schema = get_tool_by_name("fusion_reset")["inputSchema"]
+        assert "confirm" in schema["required"]
+
+    def test_rebuild_requires_script_path(self):
+        from fusion360_mcp.tools import get_tool_by_name
+
+        schema = get_tool_by_name("fusion_rebuild")["inputSchema"]
+        assert "script_path" in schema["required"]
+
+    def test_drive_joint_requires_name_and_value(self):
+        from fusion360_mcp.tools import get_tool_by_name
+
+        schema = get_tool_by_name("fusion_drive_joint")["inputSchema"]
+        assert set(schema["required"]) == {"joint_name", "value"}
+
+    def test_screenshot_enumerates_valid_views(self):
+        from fusion360_mcp.tools import get_tool_by_name
+
+        schema = get_tool_by_name("fusion_screenshot")["inputSchema"]
+        enum = schema["properties"]["views"]["items"]["enum"]
+        assert {"iso", "front", "top", "right", "back", "current"} <= set(enum)
+
+
+class TestMultiImageFormatting:
+    """fusion_screenshot must surface every view as its own image block."""
+
+    def test_each_view_becomes_a_labelled_image_block(self):
+        from fusion360_mcp.server import _format_result
+
+        result = mock_command("fusion_screenshot", {"views": ["iso", "front"]})
+        blocks = _format_result("fusion_screenshot", result)
+        kinds = [type(b).__name__ for b in blocks]
+        assert kinds.count("ImageContent") == 2
+        labels = [b.text for b in blocks if type(b).__name__ == "TextContent"]
+        assert "view: iso" in labels
+        assert "view: front" in labels
+
+    def test_base64_is_not_dumped_into_the_text_block(self):
+        from fusion360_mcp.server import _format_result
+
+        result = mock_command("fusion_screenshot", {"views": ["iso"]})
+        blocks = _format_result("fusion_screenshot", result)
+        summary = blocks[0].text
+        assert "image_base64" not in summary
+        assert "images" not in summary
