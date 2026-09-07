@@ -1101,3 +1101,25 @@ class TestExportGeometryCheck:
             "containing nothing but headers"
         )
         assert result["solids"] > 0
+
+
+class TestAnalyze:
+    """Manufacturability analysis reports problems, not just measurements."""
+
+    def test_reports_overhangs_and_feature_size(self):
+        body = mock_command("fusion_analyze", {})["bodies"][0]
+        for key in ("overhang_faces", "worst_overhang_deg", "min_edge_mm",
+                    "min_face_area_mm2", "center_of_mass_mm"):
+            assert key in body, f"analyze must report {key}"
+
+    def test_build_volume_check_is_opt_in(self):
+        without = mock_command("fusion_analyze", {})["bodies"][0]
+        with_bv = mock_command(
+            "fusion_analyze", {"build_volume_mm": [220, 220, 250]}
+        )["bodies"][0]
+        assert "fits_build_volume" not in without
+        assert with_bv["fits_build_volume"] is True
+
+    def test_clean_means_no_warnings(self):
+        result = mock_command("fusion_analyze", {})
+        assert result["clean"] is (not result["warnings"])

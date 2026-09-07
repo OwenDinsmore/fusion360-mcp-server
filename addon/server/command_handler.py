@@ -216,6 +216,7 @@ class CommandHandler:
                 "fusion_rebuild": self.fusion_rebuild,
                 "fusion_reset": self.fusion_reset,
                 "fusion_export": self.fusion_export,
+                "fusion_analyze": self.fusion_analyze,
                 "fusion_execute": self.fusion_execute,
                 # CAM
                 "cam_list_setups": self.cam_list_setups,
@@ -3255,10 +3256,12 @@ class CommandHandler:
             "bytes": len(data),
         }
 
-    def _orient_camera(self, viewport, spec):
+    def _orient_camera(self, viewport, spec, fit: bool = False):
         """Position the camera at a canonical view relative to the model.
 
-        ``spec`` is ``(eye_dir, up_vec)`` from ``_VIEW_DIRS``.
+        ``spec`` is ``(eye_dir, up_vec)`` from ``_VIEW_DIRS``.  With *fit*,
+        the camera's own isFitView does the framing, which is effectively
+        free — a separate viewport.fit() call costs ~570ms.
         """
         eye_dir, up_vec = spec
         design = self.app.activeProduct
@@ -3294,6 +3297,8 @@ class CommandHandler:
         cam.target = target
         cam.upVector = up
         cam.isSmoothTransition = False
+        if fit:
+            cam.isFitView = True
         viewport.camera = cam
 
     # ==================================================================
@@ -3417,12 +3422,21 @@ class CommandHandler:
 
             for view in views:
                 if view != "current":
-                    self._orient_camera(viewport, self._VIEW_DIRS[view])
-                if fit:
+                    # Framing rides along with the camera assignment.
+                    # viewport.fit() costs ~570ms — measured, and about 85% of
+                    # a small capture — while _orient_camera already derives
+                    # eye/target/distance from the model's bounding box, so
+                    # calling fit() as well is both redundant and by far the
+                    # most expensive thing in this loop.
+                    self._orient_camera(viewport, self._VIEW_DIRS[view],
+                                        fit=bool(fit))
+                elif fit:
+                    # "current" keeps the user's camera, so there is nothing
+                    # to derive a framing from; fit() is the only option.
                     try:
                         viewport.fit()
                     except Exception:
-                        pass  # fit() fails on an empty design; the shot is still valid
+                        pass  # fails on an empty design; the shot is still valid
                 adsk.doEvents()
 
                 fd, path = tempfile.mkstemp(suffix=".png", prefix="fusion_shot_")
@@ -4269,6 +4283,116 @@ class CommandHandler:
             # could not read the file.
             return -1
         return -1
+
+
+    # ── fusion_analyze ─────────────────────────────────────────────────
+
+    def fusion_analyze(self, overhang_deg: float = 45.0,
+                       min_feature_mm: float = 0.8,
+                       build_volume_mm=None, body_name: str = None):
+        """Manufacturability analysis.  See the tool docstring."""
+        import math as _math
+
+        bodies = []
+        for body, comp_name in self._all_bodies():
+            if body_name and body.name != body_name:
+                continue
+            bodies.append((body, comp_name))
+        if not bodies:
+            raise RuntimeError(
+                "No bodies to analyse"
+                + (f" matching {body_name!r}" if body_name else ""))
+
+        # A face overhangs when its outward normal points far enough
+        # downward.  At 45 deg the threshold normal-z is -cos(45).
+        threshold = -_math.cos(_math.radians(float(overhang_deg)))
+        results, warnings = [], []
+
+        for body, comp_name in bodies:
+            overhangs, worst, overhang_area = 0, 0.0, 0.0
+            min_face_area = float("inf")
+            for i in range(body.faces.count):
+                f = body.faces.item(i)
+                geom = f.geometry
+                area_mm2 = f.area * 100.0
+                min_face_area = min(min_face_area, area_mm2)
+                if not isinstance(geom, adsk.core.Plane):
+                    continue
+                n = geom.normal
+                nz = n.z
+                if getattr(f, "isParamReversed", False):
+                    nz = -nz
+                if nz < threshold - 1e-9:
+                    overhangs += 1
+                    overhang_area += area_mm2
+                    # 0 deg = vertical wall, 90 deg = flat downward face
+                    angle = _math.degrees(_math.asin(min(1.0, max(-1.0, -nz))))
+                    worst = max(worst, angle)
+
+            min_edge = float("inf")
+            for i in range(body.edges.count):
+                min_edge = min(min_edge, body.edges.item(i).length * 10.0)
+
+            bb = body.boundingBox
+            size = [self._mm(bb.maxPoint.x - bb.minPoint.x),
+                    self._mm(bb.maxPoint.y - bb.minPoint.y),
+                    self._mm(bb.maxPoint.z - bb.minPoint.z)]
+
+            entry = {
+                "name": body.name,
+                "component": comp_name,
+                "volume_mm3": body.volume * 1000.0,
+                "bbox_size_mm": size,
+                "overhang_faces": overhangs,
+                "overhang_area_mm2": round(overhang_area, 4),
+                "worst_overhang_deg": round(worst, 2),
+                "min_edge_mm": round(min_edge, 4) if min_edge < float("inf") else None,
+                "min_face_area_mm2": (round(min_face_area, 4)
+                                      if min_face_area < float("inf") else None),
+            }
+
+            try:
+                pp = body.physicalProperties
+                entry["mass_g"] = pp.mass * 1000.0
+                com = pp.centerOfMass
+                entry["center_of_mass_mm"] = [self._mm(com.x), self._mm(com.y),
+                                              self._mm(com.z)]
+                entry["material"] = body.material.name if body.material else None
+            except Exception as exc:
+                entry["mass_g"] = None
+                entry["mass_error"] = f"{type(exc).__name__}: {exc}"
+
+            if build_volume_mm:
+                fits = all(size[k] <= float(build_volume_mm[k]) + 1e-6
+                           for k in range(3))
+                entry["fits_build_volume"] = fits
+                if not fits:
+                    warnings.append(
+                        f"{body.name}: {[round(v, 2) for v in size]} mm does "
+                        f"not fit a {list(build_volume_mm)} mm build volume")
+
+            if overhangs:
+                warnings.append(
+                    f"{body.name}: {overhangs} face(s) overhang past "
+                    f"{overhang_deg} deg ({overhang_area:.1f} mm^2, worst "
+                    f"{worst:.1f} deg) — needs support or reorientation")
+            if entry["min_edge_mm"] is not None and \
+                    entry["min_edge_mm"] < float(min_feature_mm):
+                warnings.append(
+                    f"{body.name}: shortest edge is "
+                    f"{entry['min_edge_mm']:.3f} mm, below the "
+                    f"{min_feature_mm} mm minimum feature size")
+
+            results.append(entry)
+
+        return {
+            "clean": not warnings,
+            "overhang_threshold_deg": float(overhang_deg),
+            "min_feature_mm": float(min_feature_mm),
+            "build_volume_mm": list(build_volume_mm) if build_volume_mm else None,
+            "bodies": results,
+            "warnings": warnings,
+        }
 
     # ── fusion_execute ─────────────────────────────────────────────────
 

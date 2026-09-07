@@ -2600,6 +2600,45 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "fusion_analyze",
+        "title": "Analyze Manufacturability",
+        "description": (
+            "Check whether the design can actually be made. Complements "
+            "fusion_inspect, which reports what the model IS; this reports "
+            "what will go wrong when you build it.\n\n"
+            "Per body: overhang faces past the threshold angle with their "
+            "total area and the worst angle, shortest edge and smallest face "
+            "(against min_feature_mm), mass, centre of mass, material, and "
+            "whether the bounding box fits build_volume_mm.\n\n"
+            "overhang_deg   angle from vertical past which a face needs "
+            "support. 45 is the usual FDM rule; 0 would flag every "
+            "downward-facing surface.\n"
+            "min_feature_mm smallest printable detail — roughly the nozzle "
+            "width. Default 0.8.\n"
+            "build_volume_mm  [x, y, z] of the printer, to check fit.\n"
+            "body_name      analyse just one body.\n\n"
+            "Returns clean:true with an empty warnings[] when nothing is "
+            "flagged. A flat downward face reports as a 90 degree overhang — "
+            "that is a face lying on the build plate if it is at the bottom, "
+            "and a genuine problem if it is not."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "overhang_deg": {"type": "number",
+                                 "description": "Overhang threshold, degrees"},
+                "min_feature_mm": {"type": "number",
+                                   "description": "Smallest printable detail"},
+                "build_volume_mm": {
+                    "type": "array", "items": {"type": "number"},
+                    "minItems": 3, "maxItems": 3,
+                    "description": "[x, y, z] printer build volume"},
+                "body_name": {"type": "string",
+                              "description": "Analyse only this body"},
+            },
+        },
+    },
 ]
 
 # ── tool annotations ──────────────────────────────────────────────────
@@ -2625,6 +2664,7 @@ _READ_ONLY = {
     "fusion_screenshot",
     "fusion_inspect",
     "fusion_check_interference",
+    "fusion_analyze",
 }
 _DESTRUCTIVE = {"delete_all", "delete_parameter", "fusion_reset"}
 _IDEMPOTENT = {
@@ -2653,6 +2693,7 @@ _IDEMPOTENT = {
     "fusion_params",
     "fusion_drive_joint",
     "fusion_export",
+    "fusion_analyze",
 }
 
 for _t in TOOLS:

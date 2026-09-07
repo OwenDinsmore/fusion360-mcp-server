@@ -110,6 +110,7 @@ class TestToolAnnotations:
             "fusion_screenshot",
             "fusion_inspect",
             "fusion_check_interference",
+            "fusion_analyze",
         }
         for t in TOOLS:
             ann = t["annotations"]

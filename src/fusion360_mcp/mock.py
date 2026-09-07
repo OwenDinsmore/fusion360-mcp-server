@@ -1171,6 +1171,34 @@ def _fusion_execute(p: dict) -> dict:
     }
 
 
+def _fusion_analyze(p: dict) -> dict:
+    bv = p.get("build_volume_mm")
+    return {
+        "clean": True,
+        "overhang_threshold_deg": float(p.get("overhang_deg", 45.0)),
+        "min_feature_mm": float(p.get("min_feature_mm", 0.8)),
+        "build_volume_mm": list(bv) if bv else None,
+        "bodies": [
+            {
+                "name": "Body1",
+                "component": "MockComponent",
+                "volume_mm3": 1000.0,
+                "bbox_size_mm": [10.0, 10.0, 10.0],
+                "overhang_faces": 0,
+                "overhang_area_mm2": 0.0,
+                "worst_overhang_deg": 0.0,
+                "min_edge_mm": 10.0,
+                "min_face_area_mm2": 100.0,
+                "mass_g": 7.85,
+                "center_of_mass_mm": [5.0, 5.0, 5.0],
+                "material": "Steel",
+                **({"fits_build_volume": True} if bv else {}),
+            }
+        ],
+        "warnings": [],
+    }
+
+
 # ── default fallback ─────────────────────────────────────────────────
 
 
@@ -1295,5 +1323,6 @@ _DISPATCH: dict[str, Any] = {
     "fusion_rebuild": _fusion_rebuild,
     "fusion_reset": _fusion_reset,
     "fusion_export": _fusion_export,
+    "fusion_analyze": _fusion_analyze,
     "fusion_execute": _fusion_execute,
 }

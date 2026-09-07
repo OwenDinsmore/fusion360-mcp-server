@@ -188,6 +188,7 @@ def test_expected_tools_present():
         "fusion_reset",
         "fusion_export",
         "fusion_execute",
+        "fusion_analyze",
     }
     missing = expected - names
     assert not missing, f"Missing tools: {missing}"
