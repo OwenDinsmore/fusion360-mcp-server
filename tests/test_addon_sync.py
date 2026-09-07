@@ -4,6 +4,7 @@ The Fusion add-in is installed into Fusion's AddIns folder and cannot
 import from this package, so a few tables are duplicated:
 
 * ``addon/server/hints.py:_RULES``   ↔  ``src/fusion360_mcp/hints.py:_RULES``
+* ``addon/server/auth.py``          ↔  ``src/fusion360_mcp/auth.py``
 * ``CommandHandler._MUTATION_COMMANDS``  ↔  ``mock.py:_MUTATION_MOCKS``
 
 If they drift, agents see different error envelopes / delta payloads
@@ -143,4 +144,19 @@ def test_every_tool_has_a_real_mock():
     assert not missing, (
         f"Tools with no mock handler (mock mode would return the "
         f"'no mock handler' placeholder): {missing}"
+    )
+
+
+def test_auth_modules_are_identical():
+    """The two copies of auth.py must not drift.
+
+    They implement both halves of one handshake. If the add-in and the client
+    disagree about where the secret comes from, every call fails with
+    Unauthorized and the cause is invisible from either side alone.
+    """
+    addon = (REPO_ROOT / "addon" / "server" / "auth.py").read_text()
+    src = (REPO_ROOT / "src" / "fusion360_mcp" / "auth.py").read_text()
+    assert addon == src, (
+        "addon/server/auth.py and src/fusion360_mcp/auth.py have drifted. "
+        "They must stay byte-identical."
     )

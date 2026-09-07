@@ -2555,9 +2555,11 @@ TOOLS: list[dict] = [
             "STEP is the format to hand to another CAD package; STL and 3MF "
             "go to a slicer, and both are meshed at high refinement. 3MF "
             "carries units and colour where STL carries neither.\n\n"
-            "Verifies the file actually exists and is non-empty before "
-            "reporting success, and returns its size in bytes — Fusion's "
-            "export can report success and write nothing."
+            "Verifies the export actually contains geometry before reporting "
+            "success, and returns that count as `solids` alongside the byte "
+            "size. A byte count alone is not proof: a STEP file with no solids "
+            "is still several KB of headers, and Fusion reports success "
+            "writing it."
         ),
         "inputSchema": {
             "type": "object",

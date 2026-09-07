@@ -16,6 +16,7 @@ import time
 import traceback
 
 from . import get_logger
+from .auth import UNAUTHORIZED, token_ok
 
 log = get_logger("socket")
 
@@ -26,9 +27,10 @@ _MAX_RESTARTS = 10      # consecutive restart cap before giving up
 class Fusion360MCPServer:
     """TCP server that receives JSON commands and dispatches via EventBridge."""
 
-    def __init__(self, event_bridge, host="localhost", port=9876):
+    def __init__(self, event_bridge, host="localhost", port=9876, secret=None):
         self.host = host
         self.port = port
+        self.secret = secret
         self._bridge = event_bridge
         self._running = False
         self._socket = None
@@ -197,6 +199,15 @@ class Fusion360MCPServer:
     def _dispatch(self, client, command):
         """Submit command to bridge and send response back to client."""
         cmd_type = command.get("type", "")
+
+        # Checked before anything else, including ping and reload_handler.
+        # An unauthenticated caller must not be able to probe for the bridge's
+        # presence, reload handler code, or learn anything about the session.
+        if not token_ok(self.secret, command.get("token")):
+            log.warning("Rejected unauthenticated %r from a local client",
+                        cmd_type)
+            self._send(client, {"status": "error", "message": UNAUTHORIZED})
+            return
 
         # Reload is handled server-side, not through the bridge
         if cmd_type == "reload_handler":

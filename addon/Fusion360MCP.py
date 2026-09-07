@@ -35,6 +35,7 @@ def run(context):
 
         # Late imports so the add-in folder is on sys.path
         from .server import LOG_PATH, get_logger
+        from .server.auth import SECRET_FILE, load_secret
         from .server.command_handler import CommandHandler
         from .server.event_bridge import EventBridge
         from .server.socket_server import Fusion360MCPServer
@@ -44,10 +45,22 @@ def run(context):
         host = os.environ.get("FUSION_MCP_HOST", "localhost")
         port = int(os.environ.get("FUSION_MCP_PORT", "9876"))
 
+        # Created on first run if absent, so the bridge is authenticated by
+        # default with no setup step. The MCP server reads the same file.
+        secret = load_secret(create=True)
+
         _handler = CommandHandler()
         _bridge = EventBridge(_app, _handler)
-        _server = Fusion360MCPServer(_bridge, host=host, port=port)
+        _server = Fusion360MCPServer(_bridge, host=host, port=port,
+                                     secret=secret)
         _server.start()
+
+        if secret is None:
+            _log.warning(
+                "AUTHENTICATION DISABLED (FUSION_MCP_NO_AUTH). Any local "
+                "process can execute arbitrary Python in this Fusion session.")
+        else:
+            _log.info("Authentication enabled (secret: %s)", SECRET_FILE)
 
         _log.info("Fusion360MCP loaded - server on %s:%s  (log: %s)",
                   host, port, LOG_PATH)

@@ -7,7 +7,7 @@
     "": "Fusion360 MCP Server"
   },
   "version": "0.1.0",
-  "runOnStartup": false,
+  "runOnStartup": true,
   "supportedOS": "windows|mac",
   "editEnabled": true
 }

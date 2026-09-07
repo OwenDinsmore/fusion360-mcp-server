@@ -14,6 +14,8 @@ import socket
 import time
 from typing import Any
 
+from .auth import load_secret
+
 log = logging.getLogger("fusion360_mcp.connection")
 
 _DEFAULT_HOST = os.environ.get("FUSION_MCP_HOST", "localhost")
@@ -32,6 +34,10 @@ class Fusion360Connection:
         self.host = host
         self.port = port
         self._sock: socket.socket | None = None
+        # Never create the secret here — only the add-in does that. A client
+        # that generated its own would produce a mismatch instead of a clear
+        # "no secret found" error.
+        self._secret = load_secret(create=False)
 
     # ------------------------------------------------------------------
     # Connect / disconnect
@@ -106,10 +112,13 @@ class Fusion360Connection:
                 "Not connected to Fusion 360.  "
                 "Make sure the add-in is running.")
 
-        payload = json.dumps({
+        envelope: dict[str, Any] = {
             "type": command_type,
             "params": params or {},
-        }) + "\n"
+        }
+        if self._secret is not None:
+            envelope["token"] = self._secret
+        payload = json.dumps(envelope) + "\n"
 
         try:
             self._sock.sendall(payload.encode("utf-8"))

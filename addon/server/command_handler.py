@@ -4130,33 +4130,74 @@ class CommandHandler:
         design = self._design()
         em = design.exportManager
 
+        hidden = []
         if body_name:
-            geometry = self._body_by_name(body_name)
+            body = self._body_by_name(body_name)
             target = body_name
+            # The exporters disagree about what geometry they accept, and the
+            # error when you get it wrong is an unhelpful
+            # "3 : invlid argument geometry" (Fusion's spelling, not ours):
+            #
+            #   STEP  -> Component only. A BRepBody is rejected, and so is an
+            #            Occurrence, which is what makes exporting one body of
+            #            an assembly awkward.
+            #   STL   -> BRepBody works directly.
+            #   3MF   -> BRepBody works directly.
+            #
+            # So for STEP the body's parent component is exported with the
+            # body's siblings hidden. Siblings are matched on entityToken
+            # rather than name, so identically-named bodies still work.
+            owner = body.parentComponent
+            if fmt == "step" and owner is not None and owner != design.rootComponent:
+                geometry = owner
+                # _body_by_name returns an occurrence PROXY, and a proxy's
+                # entityToken differs from its native body's. Comparing the
+                # proxy's token against the component's native bodies matches
+                # nothing, so every body — including the target — gets hidden
+                # and STEP exports an empty part. The file is still ~3KB of
+                # headers, so a size check does not catch it.
+                native = getattr(body, "nativeObject", None) or body
+                token = native.entityToken
+                for i in range(owner.bRepBodies.count):
+                    sibling = owner.bRepBodies.item(i)
+                    if sibling.entityToken != token and sibling.isVisible:
+                        sibling.isVisible = False
+                        hidden.append(sibling)
+                if len(hidden) >= owner.bRepBodies.count:
+                    raise RuntimeError(
+                        f"Refusing to export '{body_name}': every body in "
+                        f"component '{owner.name}' was hidden, which would "
+                        f"produce an empty file")
+            else:
+                geometry = body
         else:
             geometry = design.rootComponent
             target = design.rootComponent.name
             if fmt == "step":
                 geometry = None  # STEP of the whole design takes no geometry arg
 
-        if fmt == "step":
-            opts = (
-                em.createSTEPExportOptions(out, geometry)
-                if geometry is not None
-                else em.createSTEPExportOptions(out)
-            )
-        elif fmt == "stl":
-            opts = em.createSTLExportOptions(geometry, out)
-            opts.meshRefinement = (
-                adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
-            )
-        else:  # 3mf
-            opts = em.createC3MFExportOptions(geometry, out)
-            opts.meshRefinement = (
-                adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
-            )
+        try:
+            if fmt == "step":
+                opts = (
+                    em.createSTEPExportOptions(out, geometry)
+                    if geometry is not None
+                    else em.createSTEPExportOptions(out)
+                )
+            elif fmt == "stl":
+                opts = em.createSTLExportOptions(geometry, out)
+                opts.meshRefinement = (
+                    adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+                )
+            else:  # 3mf
+                opts = em.createC3MFExportOptions(geometry, out)
+                opts.meshRefinement = (
+                    adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
+                )
 
-        ok = em.execute(opts)
+            ok = em.execute(opts)
+        finally:
+            for sibling in hidden:
+                sibling.isVisible = True
         if not ok:
             raise RuntimeError(
                 f"ExportManager.execute returned false for {fmt} -> {out}"
@@ -4170,14 +4211,64 @@ class CommandHandler:
         if size == 0:
             raise RuntimeError(f"Export produced an empty file at {out}")
 
+        # A byte count is not proof of geometry. A STEP file with no solids is
+        # still several KB of ISO-10303 headers, and Fusion reports success
+        # writing it, so verify the payload rather than the file.
+        solids = self._count_exported_solids(out, fmt)
+        if solids == 0:
+            raise RuntimeError(
+                f"Export wrote {size} bytes to {out} but it contains no "
+                f"geometry. Check that the requested body is visible and that "
+                f"the format supports the geometry it was given."
+            )
+
         return {
             "exported": True,
             "format": fmt,
             "path": out,
             "bytes": size,
+            "solids": solids,
             "target": target,
             "scope": "body" if body_name else "design",
         }
+
+    @staticmethod
+    def _count_exported_solids(path: str, fmt: str) -> int:
+        """Rough geometry count for an exported file; 0 means it is empty.
+
+        Deliberately cheap and format-specific rather than a real parse — the
+        only question being asked is "did anything actually come out".
+        """
+        try:
+            if fmt == "step":
+                with open(path, "r", errors="ignore") as fh:
+                    return fh.read().count("ADVANCED_FACE")
+            if fmt == "stl":
+                with open(path, "rb") as fh:
+                    head = fh.read(84)
+                    if head[:5].lower().lstrip() == b"solid":
+                        fh.seek(0)
+                        return fh.read().count(b"facet normal")
+                    if len(head) < 84:
+                        return 0
+                    import struct
+
+                    return struct.unpack("<I", head[80:84])[0]
+            if fmt == "3mf":
+                import zipfile
+
+                with zipfile.ZipFile(path) as zf:
+                    for name in zf.namelist():
+                        if name.endswith(".model"):
+                            return zf.read(name).decode(
+                                "utf-8", "ignore"
+                            ).count("<triangle")
+                    return 0
+        except Exception:
+            # Never fail an otherwise-good export because the check itself
+            # could not read the file.
+            return -1
+        return -1
 
     # ── fusion_execute ─────────────────────────────────────────────────
 

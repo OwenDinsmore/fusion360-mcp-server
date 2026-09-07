@@ -1156,6 +1156,7 @@ def _fusion_export(p: dict) -> dict:
         "format": fmt,
         "path": path,
         "bytes": 4096,
+        "solids": 12,
         "target": p.get("body_name") or "RootComponent",
         "scope": "body" if p.get("body_name") else "design",
     }

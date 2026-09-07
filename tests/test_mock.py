@@ -1088,3 +1088,16 @@ class TestInspectSketchCounting:
         # a root-only count reports 0 and hides the entire design.
         assert counts["sketches"] >= counts["sketches_root_only"]
         assert counts["sketches"] > 0
+
+
+class TestExportGeometryCheck:
+    """An export must be proven non-empty, not merely non-zero-length."""
+
+    def test_export_reports_a_solid_count(self):
+        result = mock_command("fusion_export", {"path": "/tmp/a.step"})
+        assert "solids" in result, (
+            "fusion_export must report how much geometry it wrote; a byte "
+            "count alone cannot distinguish a real part from a STEP file "
+            "containing nothing but headers"
+        )
+        assert result["solids"] > 0
