@@ -453,9 +453,22 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "enum": ["top", "bottom"],
                     "default": "top",
+                    "description": (
+                        "Drill into the highest up-facing (top) or lowest "
+                        "down-facing (bottom) planar face, which must be "
+                        "near-horizontal (within ~0.6 deg)"
+                    ),
                 },
-                "center_x": {"type": "number", "default": 0},
-                "center_y": {"type": "number", "default": 0},
+                "center_x": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Hole centre X in model space (cm)",
+                },
+                "center_y": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Hole centre Y in model space (cm)",
+                },
             },
         },
     },
@@ -738,10 +751,16 @@ TOOLS: list[dict] = [
             "required": ["name", "value", "unit"],
             "properties": {
                 "name": {"type": "string", "description": "Parameter name"},
-                "value": {"type": "number", "description": "Numeric value"},
+                "value": {
+                    "type": "number",
+                    "description": "Numeric value, expressed in `unit`",
+                },
                 "unit": {
                     "type": "string",
-                    "description": "Unit expression (e.g. 'mm', 'cm', 'in', 'deg')",
+                    "description": (
+                        "Unit the value is given in (e.g. 'mm', 'cm', 'in', "
+                        "'deg'). Empty means unitless."
+                    ),
                 },
                 "comment": {"type": "string", "description": "Optional comment"},
             },
@@ -756,7 +775,13 @@ TOOLS: list[dict] = [
             "required": ["name", "value"],
             "properties": {
                 "name": {"type": "string", "description": "Parameter name"},
-                "value": {"type": "number", "description": "New numeric value"},
+                "value": {
+                    "type": "number",
+                    "description": (
+                        "New numeric value, expressed in the unit the "
+                        "parameter already declares"
+                    ),
+                },
             },
         },
     },
