@@ -106,6 +106,9 @@ class CommandHandler:
             "execute_code",
             # sketch constraint mutation
             "auto_constrain",
+            # construction geometry / appearance
+            "create_ucs",
+            "set_color",
         }
     )
 
@@ -174,6 +177,7 @@ class CommandHandler:
                 # construction geometry
                 "create_construction_plane": self.create_construction_plane,
                 "create_construction_axis": self.create_construction_axis,
+                "create_ucs": self.create_ucs,
                 # assembly
                 "create_component": self.create_component,
                 "add_joint": self.add_joint,
@@ -188,6 +192,7 @@ class CommandHandler:
                 "compare_meshes": self.compare_meshes,
                 # appearance
                 "set_appearance": self.set_appearance,
+                "set_color": self.set_color,
                 # parameters
                 "get_parameters": self.get_parameters,
                 "create_parameter": self.create_parameter,
@@ -274,8 +279,23 @@ class CommandHandler:
     # ------------------------------------------------------------------
 
     def _design(self):
+        """The active document's Design product.
+
+        Prefer the explicit DesignProductType lookup: when the Manufacture
+        (or another) workspace is active, ``app.activeProduct`` returns the
+        CAM product instead of the design, which breaks every handler that
+        assumes a fusion.Design.
+        """
+        doc = self.app.activeDocument
+        if doc is not None:
+            try:
+                design = doc.products.itemByProductType("DesignProductType")
+                if design is not None:
+                    return design
+            except Exception:
+                pass
         d = self.app.activeProduct
-        if d is None:
+        if d is None or not hasattr(d, "rootComponent"):
             raise RuntimeError("No active design")
         return d
 
@@ -1849,7 +1869,18 @@ class CommandHandler:
                 f"Unknown units '{units}'. Expected one of: {sorted(unit_map)}"
             )
 
-        mesh_body = target.meshBodies.addByFile(file_path, unit_map[units])
+        try:
+            # MeshBodies.add(fullFilename, units) — the current API.
+            # Returns a MeshBodyList (a file can contain several bodies).
+            mesh_list = target.meshBodies.add(file_path, unit_map[units])
+        except AttributeError:
+            # Pre-2025 builds exposed this as addByFile returning one body.
+            mesh_list = None
+            mesh_body = target.meshBodies.addByFile(file_path, unit_map[units])
+        if mesh_list is not None:
+            if mesh_list.count == 0:
+                raise RuntimeError(f"No mesh bodies imported from {file_path}")
+            mesh_body = mesh_list.item(0)
 
         bb = mesh_body.boundingBox
         return {
@@ -2373,6 +2404,64 @@ class CommandHandler:
         axis_obj = axes.add(inp)
         return {"created": True, "name": axis_obj.name, "method": method}
 
+    def create_ucs(
+        self,
+        name: str = None,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        angle_x: float = 0,
+        angle_y: float = 0,
+        angle_z: float = 0,
+    ):
+        """Create a User Coordinate System at (x, y, z), angles in degrees.
+
+        The UCS API (May 2026, preview) is entity-based: the anchor must be
+        a sketch point / vertex / construction point.  This creates a hidden
+        reference sketch (``UCS_<name>_ref``) holding the anchor point; the
+        UCS stays parametrically linked to it, so don't delete that sketch.
+        (ConstructionPoint anchors are rejected by current builds, hence the
+        sketch-point route.)
+        """
+        root = self._root()
+
+        if z:
+            plane_in = root.constructionPlanes.createInput()
+            plane_in.setByOffset(
+                root.xYConstructionPlane, adsk.core.ValueInput.createByReal(z)
+            )
+            base_plane = root.constructionPlanes.add(plane_in)
+        else:
+            base_plane = root.xYConstructionPlane
+
+        sk = root.sketches.add(base_plane)
+        pt = sk.sketchPoints.add(adsk.core.Point3D.create(x, y, 0))
+        ref_name = f"UCS_{name or 'unnamed'}_ref"
+        sk.name = ref_name
+        sk.isVisible = False
+
+        geom = adsk.fusion.UserCoordinateSystemGeometry_createByPoint(pt)
+        inp = root.userCoordinateSystems.createInput(geom)
+        if angle_x:
+            inp.angleX = adsk.core.ValueInput.createByReal(math.radians(angle_x))
+        if angle_y:
+            inp.angleY = adsk.core.ValueInput.createByReal(math.radians(angle_y))
+        if angle_z:
+            inp.angleZ = adsk.core.ValueInput.createByReal(math.radians(angle_z))
+
+        ucs = root.userCoordinateSystems.add(inp)
+        if name:
+            try:
+                ucs.name = name
+            except Exception:
+                pass
+        return {
+            "name": ucs.name,
+            "origin": [x, y, z],
+            "angles_deg": [angle_x, angle_y, angle_z],
+            "reference_sketch": ref_name,
+        }
+
     # ------------------------------------------------------------------
     # Assembly
     # ------------------------------------------------------------------
@@ -2702,6 +2791,42 @@ class CommandHandler:
 
         return {"applied": True, "target": target_name, "appearance": appearance_name}
 
+    def set_color(
+        self,
+        body_name: str,
+        red: int,
+        green: int,
+        blue: int,
+        opacity: float = 1.0,
+    ):
+        """Assign a flat RGB color to a body via a design-local appearance.
+
+        Uses the Appearances.add + Appearance.color API (July 2026), so no
+        library copy is needed.  Appearances are reused when the same color
+        is requested again.  opacity 1.0 = fully opaque, 0.0 = invisible.
+        """
+        body = self._body_by_name(body_name)
+        design = self._design()
+
+        red = max(0, min(255, int(red)))
+        green = max(0, min(255, int(green)))
+        blue = max(0, min(255, int(blue)))
+        alpha = max(0, min(255, round(opacity * 255)))
+
+        color_name = f"MCP_{red}_{green}_{blue}_{alpha}"
+        appearance = design.appearances.itemByName(color_name)
+        if appearance is None:
+            appearance = design.appearances.add(color_name)
+            appearance.color = adsk.core.Color.create(red, green, blue, alpha)
+
+        body.appearance = appearance
+        return {
+            "body": body_name,
+            "color": [red, green, blue],
+            "opacity": alpha / 255.0,
+            "appearance": color_name,
+        }
+
     # ------------------------------------------------------------------
     # Parameters
     # ------------------------------------------------------------------
@@ -2955,10 +3080,33 @@ class CommandHandler:
     # ------------------------------------------------------------------
 
     def _get_cam(self):
-        """Get the CAM product from the active document."""
+        """Get the CAM product from the active document.
+
+        On recent Fusion builds the CAM product is only instantiated once
+        the Manufacture workspace has been activated for the document, so
+        activate it on demand instead of failing outright.  Note:
+        itemByProductType *raises* when the product doesn't exist yet.
+        """
         doc = self.app.activeDocument
-        cam_product = doc.products.itemByProductType("CAMProductType")
-        if not cam_product:
+
+        def _find_cam_product():
+            try:
+                return doc.products.itemByProductType("CAMProductType")
+            except Exception:
+                return None
+
+        cam_product = _find_cam_product()
+        if cam_product is None:
+            ws = self.ui.workspaces.itemById("CAMEnvironment")
+            if ws is not None:
+                try:
+                    ws.activate()
+                    adsk.doEvents()
+                except Exception as exc:
+                    log.warning("Manufacture workspace activation failed: %s", exc)
+                cam_product = _find_cam_product()
+
+        if cam_product is None:
             raise RuntimeError(
                 "No CAM workspace found. Open the Manufacturing workspace "
                 "in Fusion 360 at least once to initialise it."
@@ -3072,17 +3220,27 @@ class CommandHandler:
         setup = cam.setups.add(setup_input)
 
         # Stock parameters live on the created setup, not the input.
+        # Names/enumeration values verified against Fusion 2705: the
+        # "Relative size box" UI choice has the id 'default'.
+        stock_mode_map = {
+            "relative_box": "default",
+            "fixed_box": "fixedbox",
+            "relative_cylinder": "relativecylinder",
+            "fixed_cylinder": "fixedcylinder",
+            "from_solid": "solid",
+        }
         applied_stock = {}
         failed_stock = {}
         if stock_mode:
-            if self._set_cam_parameter(setup, "stockMode", stock_mode, by_string=True):
-                applied_stock["stockMode"] = stock_mode
+            mode_id = stock_mode_map.get(stock_mode, stock_mode)
+            if self._set_cam_parameter(setup, "job_stockMode", mode_id, by_string=True):
+                applied_stock["stock_mode"] = mode_id
             else:
-                failed_stock["stockMode"] = stock_mode
+                failed_stock["stock_mode"] = stock_mode
         for param_name, value in (
-            ("stockOffsetSides", stock_offset_sides),
-            ("stockOffsetTop", stock_offset_top),
-            ("stockOffsetBottom", stock_offset_bottom),
+            ("job_stockOffset", stock_offset_sides),
+            ("job_stockOffsetTop", stock_offset_top),
+            ("job_stockOffsetBottom", stock_offset_bottom),
         ):
             if value:
                 if self._set_cam_parameter(setup, param_name, value):
@@ -3107,7 +3265,12 @@ class CommandHandler:
 
     @staticmethod
     def _set_cam_parameter(target, param_name, value, by_string=False):
-        """Set a CAM parameter on a setup or operation. Returns success."""
+        """Set a CAM parameter on a setup or operation. Returns success.
+
+        CAMParameter.value is read-only on current Fusion builds — values
+        must be assigned via the ``expression`` property.  Enum parameters
+        (e.g. tool_coolant) take quoted lowercase strings ('flood').
+        """
         try:
             params = getattr(target, "parameters", None)
             if params is None:
@@ -3115,11 +3278,7 @@ class CommandHandler:
             p = params.itemByName(param_name)
             if p is None:
                 return False
-            p.value = (
-                adsk.core.ValueInput.createByString(str(value))
-                if by_string
-                else adsk.core.ValueInput.createByReal(value)
-            )
+            p.expression = f"'{value}'" if by_string else str(value)
             return True
         except Exception as exc:
             log.debug("CAM parameter %s=%r failed: %s", param_name, value, exc)
