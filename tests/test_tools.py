@@ -1,5 +1,7 @@
 """Tests for the tool registry."""
 
+import pytest
+
 from fusion360_mcp.tools import TOOLS, get_tool_by_name, get_tool_list
 
 
@@ -285,3 +287,43 @@ def test_get_tool_by_name_edge_cases():
     assert get_tool_by_name("PING") is None  # case sensitive
     assert get_tool_by_name("ping ") is None  # trailing space
 
+
+# ── Tool profiles ─────────────────────────────────────────────────────
+
+
+def test_agent_profile_offers_the_fusion_tools_and_ping_only():
+    from fusion360_mcp.tools import offered
+
+    names = {t.name for t in get_tool_list("agent")}
+    assert "ping" in names
+    assert {"fusion_rebuild", "fusion_inspect", "fusion_sweep_joint",
+            "fusion_execute"} <= names
+    assert all(n == "ping" or n.startswith("fusion_") for n in names)
+    # The primitives an agent building by script must not be handed.
+    for n in ("create_hole", "create_parameter", "set_parameter", "extrude",
+              "execute_code", "delete_all"):
+        assert n not in names
+        assert not offered(n, "agent")
+        assert offered(n, "all")
+
+
+def test_all_profile_offers_every_tool():
+    assert {t.name for t in get_tool_list("all")} == {t["name"] for t in TOOLS}
+
+
+def test_profile_comes_from_the_environment(monkeypatch):
+    from fusion360_mcp.tools import tool_profile
+
+    monkeypatch.delenv("FUSION_MCP_TOOLS", raising=False)
+    assert tool_profile() == "agent"
+    monkeypatch.setenv("FUSION_MCP_TOOLS", " ALL ")
+    assert tool_profile() == "all"
+    monkeypatch.setenv("FUSION_MCP_TOOLS", "everything")
+    with pytest.raises(ValueError):
+        tool_profile()
+
+
+def test_offered_is_false_for_an_unknown_tool():
+    from fusion360_mcp.tools import offered
+
+    assert not offered("nonexistent_tool", "all")

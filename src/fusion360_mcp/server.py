@@ -23,7 +23,7 @@ from .connection import (
     reset_connection,
 )
 from .mock import mock_command
-from .tools import get_tool_by_name, get_tool_list
+from .tools import get_tool_by_name, get_tool_list, offered, tool_profile
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -206,9 +206,12 @@ def main(mode: str, host: str, port: int) -> int:
 
     # ── tools ────────────────────────────────────────────────────────
 
+    profile = tool_profile()
+    log.info("Offering the %r tool profile", profile)
+
     @app.list_tools()
     async def list_tools() -> list[types.Tool]:
-        return get_tool_list()
+        return get_tool_list(profile)
 
     @app.call_tool()
     async def call_tool(
@@ -218,6 +221,11 @@ def main(mode: str, host: str, port: int) -> int:
         tool_def = get_tool_by_name(name)
         if not tool_def:
             raise ValueError(f"Unknown tool: {name}")
+        if not offered(name, profile):
+            raise ValueError(
+                f"Tool {name!r} is not offered in the {profile!r} profile. "
+                "Start the server with FUSION_MCP_TOOLS=all to enable it."
+            )
 
         try:
             result = _send(mode, name, arguments, host=host, port=port)

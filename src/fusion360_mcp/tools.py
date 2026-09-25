@@ -5,6 +5,8 @@ Each entry becomes a tool that Claude can call.  The ``inputSchema`` is
 JSON Schema that the MCP SDK validates before forwarding arguments.
 """
 
+import os
+
 import mcp.types as types
 
 TOOLS: list[dict] = [
@@ -2989,10 +2991,49 @@ for _t in TOOLS:
     }
 
 
-def get_tool_list() -> list[types.Tool]:
-    """Convert tool dicts to MCP Tool objects."""
+# ── Tool profiles ─────────────────────────────────────────────────────
+#
+# FUSION_MCP_TOOLS picks what the server OFFERS the agent:
+#
+#   agent (default)  the fusion_* tools and ping: build from a script,
+#                    inspect, sweep, analyse, screenshot, export, and
+#                    fusion_execute as the escape hatch.
+#   all              every tool, including the primitive sketch / extrude /
+#                    CAM set.
+#
+# An agent that builds by script never needs create_hole or create_parameter,
+# and offering them is how one gets picked: a hundred tools in the list is a
+# hundred chances to reach for the wrong one. A tool outside the profile is
+# refused by name, with how to enable it.
+TOOL_PROFILES: dict[str, object] = {
+    "agent": lambda name: name.startswith("fusion_") or name == "ping",
+    "all": lambda name: True,
+}
+
+
+def tool_profile() -> str:
+    """The active profile, from FUSION_MCP_TOOLS (default "agent")."""
+    profile = os.environ.get("FUSION_MCP_TOOLS", "agent").strip().lower()
+    if profile not in TOOL_PROFILES:
+        raise ValueError(
+            f"FUSION_MCP_TOOLS={profile!r}: expected one of "
+            f"{sorted(TOOL_PROFILES)}"
+        )
+    return profile
+
+
+def offered(name: str, profile: str = "all") -> bool:
+    """Whether *profile* offers the tool called *name*."""
+    return get_tool_by_name(name) is not None and TOOL_PROFILES[profile](name)
+
+
+def get_tool_list(profile: str = "all") -> list[types.Tool]:
+    """Convert tool dicts to MCP Tool objects — those *profile* offers."""
     result = []
+    keep = TOOL_PROFILES[profile]
     for t in TOOLS:
+        if not keep(t["name"]):
+            continue
         ann = t.get("annotations")
         tool = types.Tool(
             name=t["name"],
