@@ -1083,6 +1083,7 @@ def _fusion_drive_joint(p: dict) -> dict:
         "unit": "mm",
         "requested": value,
         "actual": value,
+        "clamped_to_limit": False,
         "clamped": False,
         "out_of_range": None,
         "before": dict(state, value_mm=0.0),

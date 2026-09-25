@@ -626,6 +626,7 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "enum": [
                             "iso", "iso_ne", "iso_nw", "iso_sw",
+                            "iso_under", "iso_under_nw",
                             "front", "back", "top", "bottom",
                             "right", "left",
                         ],
@@ -2421,6 +2422,11 @@ TOOLS: list[dict] = [
         "name": "fusion_drive_joint",
         "title": "Drive Joint",
         "description": (
+            "Drive one joint to a value. A value past the joint's limit is "
+            "CLAMPED TO THAT LIMIT and reported with clamped_to_limit=true — "
+            "Fusion itself would set the joint to ZERO instead, which reads "
+            "as the part snapping back to its start.\n"
+            
             "Set a joint's value so motion can be verified without writing a "
             "script. Use it to sweep a mechanism through its travel and check "
             "for collisions at each stop with fusion_check_interference.\n\n"

@@ -107,6 +107,12 @@ class CommandHandler:
         "back": ((0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
         "top": ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
         "bottom": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+        # Isometrics from BELOW. Every iso here looked down, so a part whose
+        # important face is its underside — a bond face, a screen that faces
+        # the surface it mounts to — had only the flat "bottom" view, which
+        # shows an outline and no form.
+        "iso_under": ((1.0, -1.0, -1.0), (0.0, 0.0, 1.0)),
+        "iso_under_nw": ((-1.0, 1.0, -1.0), (0.0, 0.0, 1.0)),
         "right": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
         "left": ((-1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
     }
@@ -3317,6 +3323,11 @@ class CommandHandler:
         ``spec`` is ``(eye_dir, up_vec)`` from ``_VIEW_DIRS``.  With *fit*,
         the camera's own isFitView does the framing, which is effectively
         free — a separate viewport.fit() call costs ~570ms.
+
+        There is no margin control, because there is nothing to control it
+        with: ``Camera.viewExtents`` accepts an assignment on this build and
+        then reads back unchanged, so the fit frames the model edge to edge
+        and a wide flat part touches all four sides of the image.
         """
         eye_dir, up_vec = spec
         design = self.app.activeProduct
@@ -3325,7 +3336,10 @@ class CommandHandler:
         # Target is the model centroid (or origin if no bodies).
         target = adsk.core.Point3D.create(0.0, 0.0, 0.0)
         distance = 20.0
-        if root is not None and root.bRepBodies.count > 0:
+        # root.boundingBox covers occurrences too, so gating on
+        # root.bRepBodies.count skipped centring entirely for any design whose
+        # bodies live in components — which is every design in this project.
+        if root is not None:
             try:
                 bbox = root.boundingBox
                 if bbox is not None:
@@ -3454,9 +3468,16 @@ class CommandHandler:
             # not a ValueInput — one of the few places in the API that is.
             inp = analyses.createInput(
                 self._construction_plane(plane), self._cm(offset_mm))
-            if section.get("flip") and hasattr(inp, "isFlipped"):
-                inp.isFlipped = True
             analysis = analyses.add(inp)
+            # SectionAnalysisInput has no isFlipped. Assigning one created a
+            # Python attribute on the SWIG wrapper that Fusion never read, so
+            # `flip` was accepted and did nothing and every section came back
+            # showing the outside of the near half — a solid silhouette that
+            # looks like the section simply failed. The direction lives on the
+            # ANALYSIS, as a method, and is only available after add().
+            if section.get("flip"):
+                if not analysis.flip():
+                    raise RuntimeError("section flip() refused")
         try:
             return self._fusion_screenshot(views, shaded, width, height, fit,
                                            section=section)
@@ -3863,16 +3884,21 @@ class CommandHandler:
                 f"{before['type']} joint and has no single drivable value"
             )
 
-        # Warn rather than refuse: Fusion itself clamps, and a caller sweeping
-        # a range wants to know it hit the stop, not get an exception.
+        # Fusion does NOT clamp a joint driven past its limit — it sets the
+        # value to ZERO. A sweep whose last step overshoots the stop by a
+        # rounding error therefore snaps the part all the way back to its start
+        # while everything coupled to it stays where it was, and the result is
+        # a collision reported at exactly one step of an otherwise clean sweep.
+        # So clamp here, and say so: a caller sweeping a range wants to land on
+        # the stop, not at the origin and not with an exception.
         out_of_range = None
         if lim is not None:
             lo = lim.minimumValue if lim.isMinimumValueEnabled else None
             hi = lim.maximumValue if lim.isMaximumValueEnabled else None
             if lo is not None and internal < lo - 1e-9:
-                out_of_range = "below_minimum"
+                out_of_range, internal = "below_minimum", lo
             elif hi is not None and internal > hi + 1e-9:
-                out_of_range = "above_maximum"
+                out_of_range, internal = "above_maximum", hi
 
         try:
             setattr(motion, attr, internal)
@@ -3894,6 +3920,7 @@ class CommandHandler:
             "clamped": (
                 actual is not None and abs(actual - float(value)) > 1e-6
             ),
+            "clamped_to_limit": out_of_range is not None,
             "out_of_range": out_of_range,
             "before": before,
             "after": after,
