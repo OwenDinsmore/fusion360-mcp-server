@@ -4616,6 +4616,10 @@ class CommandHandler:
         return problems
 
     _last_trace: dict = {}
+    # The check names the last build of each (script, document, args)
+    # declared. A build that returns fewer than last time, with no error, is
+    # what a stale module looks like: its checks went to another fusionlib.
+    _last_checks: dict = {}
 
     def fusion_rebuild(self, script_path: str, args=None, document: str = None,
                        fresh: bool = False, verify: bool = True):
@@ -4823,6 +4827,21 @@ class CommandHandler:
                 result["report_error"] = f"{type(exc).__name__}: {exc}"
         if contract is not None:
             result["contract"] = contract
+            ckey = (path, document or "", repr(sorted((args or {}).items())))
+            names = [c["name"] for c in contract.get("checks", [])]
+            before = self._last_checks.get(ckey)
+            if before is not None:
+                lost = sorted(set(before) - set(names))
+                if lost:
+                    result["contract_lost"] = {
+                        "previous": len(before), "now": len(names),
+                        "lost": lost[:20], "more": max(0, len(lost) - 20)}
+                    result.setdefault("warnings", []).append(
+                        f"{len(lost)} check(s) the previous build of this "
+                        f"script declared are gone ({len(before)} -> "
+                        f"{len(names)}). If the script did not drop them, a "
+                        f"module is stale: compare reloaded_modules.")
+            self._last_checks[ckey] = names
         if trace is not None:
             key = (path, document or "")
             previous = self._last_trace.get(key)

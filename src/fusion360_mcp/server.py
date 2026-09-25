@@ -69,6 +69,7 @@ _SPECIAL_KEYS = {
     "deltas",
     "image_base64",
     "images",
+    "warnings",
 }
 
 
@@ -128,8 +129,11 @@ def _format_result(
             isError=True,
         )
 
-    # Success path.
+    # Success path. Warnings go first: a build that succeeded but lost
+    # checks since last time is the result that must not be scrolled past.
     lines = [f"**{name}** OK"]
+    for w in result.get("warnings") or []:
+        lines.append(f"  WARNING: {w}")
     for k, v in result.items():
         if k in _SPECIAL_KEYS:
             continue

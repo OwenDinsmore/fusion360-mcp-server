@@ -132,6 +132,18 @@ class TestFormatResult:
         assert "close the loop" in text
         assert "No profiles in sketch" in text
 
+    def test_warnings_come_first(self):
+        result = {
+            "ok": True,
+            "contract": {"passed": 1, "failed": 0},
+            "trace": [{"step": "Box"}] * 50,
+            "warnings": ["2 check(s) the previous build declared are gone"],
+        }
+        text = _format_result("fusion_rebuild", result)[0].text
+        lines = text.splitlines()
+        assert lines[1] == "  WARNING: 2 check(s) the previous build declared are gone"
+        assert "  warnings:" not in text
+
     def test_success_path_lists_fields(self):
         result = {
             "ok": True,
