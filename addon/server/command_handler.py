@@ -4741,13 +4741,9 @@ class CommandHandler:
                 entries = [str(e) for e in (getattr(raw, "_path", None) or [])]
             return bool(entries) and all(_in_tree(e) for e in entries)
 
-        # Decide EVERY module before deleting ANY. A nested namespace package
-        # (cad/products/<product>/, imported as products.<product>.<module>)
-        # recomputes its __path__ through its parent; delete "products" first
-        # and reading "products.card_vault".__path__ raises, the except below
-        # skipped it, and the surviving package object kept serving the
-        # PREVIOUS build's submodule — bound to the previous fusionlib, so its
-        # checks and trace went nowhere.
+        # Decide every module before deleting any: a nested namespace package
+        # recomputes its __path__ through its parent, so once the parent is
+        # gone it can't be judged and would survive, serving a stale submodule.
         doomed = []
         for mod_name, mod in list(sys.modules.items()):
             try:
