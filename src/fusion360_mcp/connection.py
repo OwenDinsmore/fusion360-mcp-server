@@ -15,11 +15,24 @@ import time
 from typing import Any
 
 from .auth import load_secret
+from .hints import classify as _classify
+from .mock import _MUTATION_MOCKS as _MUTATION_COMMANDS
 
 log = logging.getLogger("fusion360_mcp.connection")
 
 _DEFAULT_HOST = os.environ.get("FUSION_MCP_HOST", "localhost")
-_DEFAULT_PORT = int(os.environ.get("FUSION_MCP_PORT", "9876"))
+
+
+def _default_port() -> int:
+    raw = os.environ.get("FUSION_MCP_PORT", "9876")
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Invalid FUSION_MCP_PORT %r — falling back to 9876", raw)
+        return 9876
+
+
+_DEFAULT_PORT = _default_port()
 _RECV_BUF = 65536
 # Slightly over the add-in's longest command budget, so the add-in times
 # out first and returns a useful message rather than the client giving up
@@ -28,6 +41,17 @@ _TIMEOUT = float(os.environ.get("FUSION_MCP_CLIENT_TIMEOUT", "610"))
 _PING_TIMEOUT = 5.0
 _MAX_RETRIES = 2
 _RETRY_DELAY = 1.0  # seconds between reconnect attempts
+
+
+class FusionError(RuntimeError):
+    """Structured error reported by the add-in (or a timed-out command)."""
+
+    def __init__(
+        self, message: str, error_kind: str = "UNKNOWN", hints: list[str] | None = None
+    ):
+        super().__init__(message)
+        self.error_kind = error_kind
+        self.hints = hints or []
 
 
 class Fusion360Connection:
@@ -83,9 +107,13 @@ class Fusion360Connection:
     # ------------------------------------------------------------------
 
     def ping(self) -> bool:
-        """Send a ping and return True if the add-in responds."""
+        """Send a ping and return True if the add-in responds.
+
+        Uses a short timeout and no retries so it stays a cheap health
+        check even when the Fusion main thread is wedged.
+        """
         try:
-            self.send_command("ping")
+            self.send_command("ping", retries=0, timeout=_PING_TIMEOUT)
             return True
         except Exception:
             return False
@@ -102,18 +130,25 @@ class Fusion360Connection:
     # Send / receive
     # ------------------------------------------------------------------
 
-    def send_command(self, command_type: str,
-                     params: dict[str, Any] | None = None,
-                     retries: int = _MAX_RETRIES) -> dict:
+    def send_command(
+        self,
+        command_type: str,
+        params: dict[str, Any] | None = None,
+        retries: int = _MAX_RETRIES,
+        timeout: float = _TIMEOUT,
+    ) -> dict:
         """Send a JSON command and block until a JSON response arrives.
 
-        On connection failure, retries up to ``retries`` times with a
-        fresh socket before raising.
+        On connection failure, read-only commands are retried up to
+        ``retries`` times with a fresh socket.  Mutation commands are
+        **never** retried after a send was attempted: the add-in may have
+        queued or executed the command already, and re-sending could apply
+        the change twice.
         """
         if not self._sock and not self.connect():
             raise ConnectionError(
-                "Not connected to Fusion 360.  "
-                "Make sure the add-in is running.")
+                "Not connected to Fusion 360.  Make sure the add-in is running."
+            )
 
         envelope: dict[str, Any] = {
             "type": command_type,
@@ -125,23 +160,48 @@ class Fusion360Connection:
         envelope["client"] = os.environ.get("FUSION_MCP_CLIENT", "mcp-server")
         payload = json.dumps(envelope) + "\n"
 
+        is_mutation = command_type in _MUTATION_COMMANDS
         try:
             self._sock.sendall(payload.encode("utf-8"))
-            self._sock.settimeout(_TIMEOUT)
+            self._sock.settimeout(timeout)
             response = self._recv_json()
         except (socket.timeout, OSError, ConnectionError) as exc:
             log.error("Socket error: %s", exc)
             self.disconnect()
+            if is_mutation:
+                raise FusionError(
+                    f"{command_type}: no response from Fusion "
+                    f"({exc}). The command was NOT retried, but it may "
+                    "still have executed — call get_scene_info to check "
+                    "the design state before trying again.",
+                    error_kind="TIMEOUT",
+                    hints=[
+                        "Call get_scene_info to see whether the "
+                        "operation partially applied.",
+                        "Long operations (CAM toolpaths, complex fillets) "
+                        "can exceed the add-in's bridge timeout (30s for "
+                        "most commands, 600s for fusion_rebuild) — split "
+                        "them into smaller steps.",
+                    ],
+                ) from exc
             if retries > 0:
                 log.info("Retrying (%d left)...", retries)
                 time.sleep(_RETRY_DELAY)
                 if self.connect():
-                    return self.send_command(command_type, params,
-                                            retries=retries - 1)
+                    return self.send_command(
+                        command_type, params, retries=retries - 1, timeout=timeout
+                    )
             raise ConnectionError(f"Lost connection to Fusion 360: {exc}") from exc
 
         if response.get("status") == "error":
-            raise RuntimeError(response.get("message", "Unknown error"))
+            message = response.get("message", "Unknown error")
+            kind = response.get("error_kind")
+            hints = response.get("hints")
+            if kind is None:
+                kind, classified_hints = _classify(message)
+                if hints is None:
+                    hints = classified_hints
+            raise FusionError(message, error_kind=kind, hints=hints)
 
         return response.get("result", {})
 
@@ -173,14 +233,30 @@ class Fusion360Connection:
 _connection: Fusion360Connection | None = None
 
 
-def get_connection(*, host: str = _DEFAULT_HOST,
-                   port: int = _DEFAULT_PORT) -> Fusion360Connection:
-    """Return (and lazily create) a shared connection."""
+def get_connection(
+    *, host: str = _DEFAULT_HOST, port: int = _DEFAULT_PORT
+) -> Fusion360Connection:
+    """Return (and lazily create) a shared connection.
+
+    If the cached connection targets a different host/port than
+    requested, it is dropped and recreated — silently reusing the wrong
+    endpoint is worse than reconnecting.
+    """
     global _connection
-    if _connection is not None:
-        return _connection
-    _connection = Fusion360Connection(host, port)
-    _connection.connect()
+    if _connection is not None and (
+        _connection.host != host or _connection.port != port
+    ):
+        log.info(
+            "Endpoint changed (%s:%s -> %s:%s), reconnecting",
+            _connection.host,
+            _connection.port,
+            host,
+            port,
+        )
+        reset_connection()
+    if _connection is None:
+        _connection = Fusion360Connection(host, port)
+        _connection.connect()
     return _connection
 
 

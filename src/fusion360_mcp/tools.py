@@ -453,9 +453,22 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "enum": ["top", "bottom"],
                     "default": "top",
+                    "description": (
+                        "Drill into the highest up-facing (top) or lowest "
+                        "down-facing (bottom) planar face, which must be "
+                        "near-horizontal (within ~0.6 deg)"
+                    ),
                 },
-                "center_x": {"type": "number", "default": 0},
-                "center_y": {"type": "number", "default": 0},
+                "center_x": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Hole centre X in model space (cm)",
+                },
+                "center_y": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Hole centre Y in model space (cm)",
+                },
             },
         },
     },
@@ -609,8 +622,7 @@ TOOLS: list[dict] = [
                 "title": {
                     "type": "string",
                     "description": (
-                        "Heading shown on the sheet "
-                        "(default: document name)."
+                        "Heading shown on the sheet (default: document name)."
                     ),
                 },
                 "notes": {
@@ -625,10 +637,18 @@ TOOLS: list[dict] = [
                     "items": {
                         "type": "string",
                         "enum": [
-                            "iso", "iso_ne", "iso_nw", "iso_sw",
-                            "iso_under", "iso_under_nw",
-                            "front", "back", "top", "bottom",
-                            "right", "left",
+                            "iso",
+                            "iso_ne",
+                            "iso_nw",
+                            "iso_sw",
+                            "iso_under",
+                            "iso_under_nw",
+                            "front",
+                            "back",
+                            "top",
+                            "bottom",
+                            "right",
+                            "left",
                         ],
                     },
                     "description": (
@@ -641,9 +661,7 @@ TOOLS: list[dict] = [
                     "items": {"type": "integer"},
                     "minItems": 2,
                     "maxItems": 2,
-                    "description": (
-                        "[width, height] in pixels (default [1200, 900])."
-                    ),
+                    "description": ("[width, height] in pixels (default [1200, 900])."),
                 },
                 "output_dir": {
                     "type": "string",
@@ -671,8 +689,7 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "enum": ["stl", "step", "stp", "f3d"],
                     "description": (
-                        "Output format. Inferred from file_path extension "
-                        "if omitted."
+                        "Output format. Inferred from file_path extension if omitted."
                     ),
                 },
                 "body_name": {
@@ -707,9 +724,7 @@ TOOLS: list[dict] = [
                 },
                 "component_name": {
                     "type": "string",
-                    "description": (
-                        "Target component name (omit for root component)"
-                    ),
+                    "description": ("Target component name (omit for root component)"),
                 },
                 "units": {
                     "type": "string",
@@ -739,10 +754,16 @@ TOOLS: list[dict] = [
             "required": ["name", "value", "unit"],
             "properties": {
                 "name": {"type": "string", "description": "Parameter name"},
-                "value": {"type": "number", "description": "Numeric value"},
+                "value": {
+                    "type": "number",
+                    "description": "Numeric value, expressed in `unit`",
+                },
                 "unit": {
                     "type": "string",
-                    "description": "Unit expression (e.g. 'mm', 'cm', 'in', 'deg')",
+                    "description": (
+                        "Unit the value is given in (e.g. 'mm', 'cm', 'in', "
+                        "'deg'). Empty means unitless."
+                    ),
                 },
                 "comment": {"type": "string", "description": "Optional comment"},
             },
@@ -757,7 +778,13 @@ TOOLS: list[dict] = [
             "required": ["name", "value"],
             "properties": {
                 "name": {"type": "string", "description": "Parameter name"},
-                "value": {"type": "number", "description": "New numeric value"},
+                "value": {
+                    "type": "number",
+                    "description": (
+                        "New numeric value, expressed in the unit the "
+                        "parameter already declares"
+                    ),
+                },
             },
         },
     },
@@ -826,6 +853,34 @@ TOOLS: list[dict] = [
                 "sketch_name": {
                     "type": "string",
                     "description": "Sketch name (default: most recent)",
+                },
+            },
+        },
+    },
+    {
+        "name": "auto_constrain",
+        "title": "Auto-Constrain Sketch",
+        "description": (
+            "Automatically add geometric constraints and dimensions to fully "
+            "constrain a sketch (Fusion 2026+ AutoConstrain API). "
+            "result_option: 1 = thorough/slow (default), 2 = fast, "
+            "3 = may move geometry within tolerance."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sketch_name": {
+                    "type": "string",
+                    "description": "Sketch name (default: most recent)",
+                },
+                "result_option": {
+                    "type": "integer",
+                    "enum": [1, 2, 3],
+                    "default": 1,
+                    "description": (
+                        "1 = most thorough (slowest), 2 = fastest, "
+                        "3 = adjusts geometry within tolerance"
+                    ),
                 },
             },
         },
@@ -994,6 +1049,39 @@ TOOLS: list[dict] = [
                     "type": "integer",
                     "description": "Edge index on the body",
                     "minimum": 0,
+                },
+            },
+        },
+    },
+    {
+        "name": "create_ucs",
+        "title": "Create User Coordinate System",
+        "description": (
+            "Create a UCS at (x, y, z) with optional rotation (Fusion 2026+ "
+            "UCS API, preview). A hidden reference sketch is created to anchor "
+            "the UCS — do not delete it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "UCS name"},
+                "x": {"type": "number", "default": 0, "description": "Origin X (cm)"},
+                "y": {"type": "number", "default": 0, "description": "Origin Y (cm)"},
+                "z": {"type": "number", "default": 0, "description": "Origin Z (cm)"},
+                "angle_x": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Rotation about X (degrees)",
+                },
+                "angle_y": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Rotation about Y (degrees)",
+                },
+                "angle_z": {
+                    "type": "number",
+                    "default": 0,
+                    "description": "Rotation about Z (degrees)",
                 },
             },
         },
@@ -1414,7 +1502,8 @@ TOOLS: list[dict] = [
                 "origin_x": {"type": "number", "default": 0},
                 "origin_y": {"type": "number", "default": 0},
                 "origin_z": {
-                    "type": "number", "default": 0,
+                    "type": "number",
+                    "default": 0,
                     "description": "Z-offset of sketch plane (cm)",
                 },
                 "plane": {
@@ -1663,6 +1752,29 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "name": "compare_meshes",
+        "title": "Compare Mesh Bodies",
+        "description": (
+            "Compare two mesh bodies and return deviation statistics "
+            "(min/max/mean/RMS signed distance in cm) — e.g. validate an "
+            "imported STL against a reference mesh. Requires Fusion 2026+."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["mesh_name_a", "mesh_name_b"],
+            "properties": {
+                "mesh_name_a": {
+                    "type": "string",
+                    "description": "Name of the first mesh body",
+                },
+                "mesh_name_b": {
+                    "type": "string",
+                    "description": "Name of the reference mesh body",
+                },
+            },
+        },
+    },
     # ── appearance / material ──────────────────────────────────────────
     {
         "name": "set_appearance",
@@ -1696,6 +1808,32 @@ TOOLS: list[dict] = [
                     "type": "integer",
                     "minimum": 0,
                     "description": ("Face index (if target_type=face)"),
+                },
+            },
+        },
+    },
+    {
+        "name": "set_color",
+        "title": "Set Body Color",
+        "description": (
+            "Assign a flat RGB color to a body (creates/reuses a design-local "
+            "appearance). Useful for visually distinguishing parts before "
+            "render_view."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["body_name", "red", "green", "blue"],
+            "properties": {
+                "body_name": {"type": "string", "description": "Body name"},
+                "red": {"type": "integer", "minimum": 0, "maximum": 255},
+                "green": {"type": "integer", "minimum": 0, "maximum": 255},
+                "blue": {"type": "integer", "minimum": 0, "maximum": 255},
+                "opacity": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "default": 1,
+                    "description": "1.0 = opaque, 0.0 = invisible",
                 },
             },
         },
@@ -2051,7 +2189,9 @@ TOOLS: list[dict] = [
                     "type": "number",
                     "minimum": 0.001,
                     "description": (
-                        "Tool diameter (cm) — used if tool_number not specified"
+                        "Not supported — tool geometry comes from the CAM "
+                        "tool library; select via tool_number instead. "
+                        "Passing this raises an error."
                     ),
                 },
                 "stepdown": {
@@ -2130,9 +2270,10 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "default": "fanuc",
                     "description": (
-                        "Post processor name "
-                        "(e.g. 'fanuc', 'grbl', 'haas', "
-                        "'linuxcnc', 'mach3')"
+                        "Post processor short name ('fanuc', 'grbl', 'haas') "
+                        "resolved against the local post folder when the "
+                        "Fusion build provides one, or a full path to a "
+                        ".cps file (required on cloud-post builds)"
                     ),
                 },
                 "output_folder": {
@@ -2794,6 +2935,7 @@ _READ_ONLY = {
     "measure_distance",
     "measure_angle",
     "check_interference",
+    "compare_meshes",
     "ping",
     "cam_list_setups",
     "cam_list_operations",
@@ -2817,8 +2959,10 @@ _IDEMPOTENT = {
     "measure_distance",
     "measure_angle",
     "check_interference",
+    "compare_meshes",
     "set_parameter",
     "set_appearance",
+    "set_color",
     "cam_list_setups",
     "cam_list_operations",
     "cam_get_operation_info",

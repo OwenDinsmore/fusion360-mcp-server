@@ -23,6 +23,8 @@ import adsk.fusion
 
 from . import get_logger
 from . import hints as _hints
+from . import hole_geometry as _hole_geom
+from . import parameter_units as _param_units
 
 log = get_logger("handler")
 
@@ -172,6 +174,11 @@ class CommandHandler:
             "fusion_rebuild",
             "fusion_reset",
             "fusion_execute",
+            # sketch constraint mutation
+            "auto_constrain",
+            # construction geometry / appearance
+            "create_ucs",
+            "set_color",
         }
     )
 
@@ -193,6 +200,7 @@ class CommandHandler:
                 "draw_spline": self.draw_spline,
                 "create_polygon": self.create_polygon,
                 "add_constraint": self.add_constraint,
+                "auto_constrain": self.auto_constrain,
                 "add_dimension": self.add_dimension,
                 "offset_curve": self.offset_curve,
                 "trim_curve": self.trim_curve,
@@ -239,6 +247,7 @@ class CommandHandler:
                 # construction geometry
                 "create_construction_plane": self.create_construction_plane,
                 "create_construction_axis": self.create_construction_axis,
+                "create_ucs": self.create_ucs,
                 # assembly
                 "create_component": self.create_component,
                 "add_joint": self.add_joint,
@@ -250,8 +259,10 @@ class CommandHandler:
                 "get_physical_properties": self.get_physical_properties,
                 "create_section_analysis": self.create_section_analysis,
                 "check_interference": self.check_interference,
+                "compare_meshes": self.compare_meshes,
                 # appearance
                 "set_appearance": self.set_appearance,
+                "set_color": self.set_color,
                 # parameters
                 "get_parameters": self.get_parameters,
                 "create_parameter": self.create_parameter,
@@ -306,7 +317,11 @@ class CommandHandler:
         if handler is None:
             # Infrastructure-level failure (not an application error) —
             # keep the legacy error envelope so the client raises.
-            return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+            return {
+                "status": "error",
+                "error_kind": "UNKNOWN_COMMAND",
+                "message": f"Unknown command: {cmd_type}",
+            }
 
         is_mutation = cmd_type in self._MUTATION_COMMANDS
         snap_before = self._snapshot() if is_mutation else None
@@ -346,8 +361,23 @@ class CommandHandler:
     # ------------------------------------------------------------------
 
     def _design(self):
+        """The active document's Design product.
+
+        Prefer the explicit DesignProductType lookup: when the Manufacture
+        (or another) workspace is active, ``app.activeProduct`` returns the
+        CAM product instead of the design, which breaks every handler that
+        assumes a fusion.Design.
+        """
+        doc = self.app.activeDocument
+        if doc is not None:
+            try:
+                design = doc.products.itemByProductType("DesignProductType")
+                if design is not None:
+                    return design
+            except Exception:
+                pass
         d = self.app.activeProduct
-        if d is None:
+        if d is None or not hasattr(d, "rootComponent"):
             raise RuntimeError("No active design")
         return d
 
@@ -823,6 +853,53 @@ class CommandHandler:
         constraint_map[constraint_type]()
         return {"sketch": sketch.name, "constraint_type": constraint_type}
 
+    def auto_constrain(
+        self,
+        sketch_name: str = None,
+        result_option: int = 1,
+    ):
+        """Auto-constrain a sketch using Fusion's AutoConstrain (Jan 2026+).
+
+        result_option: 1 = thorough (default), 2 = fast,
+        3 = may move geometry within tolerance.
+        """
+        sketch = (
+            self._sketch_by_name(sketch_name) if sketch_name else self._last_sketch()
+        )
+
+        option_map = {
+            1: adsk.fusion.AutoConstrainResultTypes.Option1AutoConstrainResultType,
+            2: adsk.fusion.AutoConstrainResultTypes.Option2AutoConstrainResultType,
+            3: adsk.fusion.AutoConstrainResultTypes.Option3AutoConstrainResultType,
+        }
+        option = option_map.get(result_option)
+        if option is None:
+            raise RuntimeError(
+                f"Invalid result_option {result_option} — use 1 (thorough), "
+                "2 (fast), or 3 (may adjust geometry within tolerance)."
+            )
+
+        ac_input = sketch.createAutoConstrainInput()
+        ac_input.resultOption = option
+        result = sketch.autoConstrain(ac_input)
+        if result is None:
+            # Option 3 returns null when the sketch is not eligible for
+            # geometry adjustment.
+            raise RuntimeError(
+                "autoConstrain returned no result — the sketch is not "
+                "eligible for geometry adjustment. Retry with "
+                "result_option 1 or 2."
+            )
+
+        return {
+            "sketch": sketch.name,
+            "is_fully_constrained": result.isFullyConstrained,
+            "constraints_added": len(result.addedConstraints),
+            "dimensions_added": len(result.addedDimensions),
+            "entities_moved": len(result.movedGeometry),
+            "result_option": result_option,
+        }
+
     def add_dimension(
         self,
         dimension_type: str,
@@ -1198,40 +1275,75 @@ class CommandHandler:
             else root.bRepBodies.item(body_index)
         )
 
-        # Find the target face
-        bbox = body.boundingBox
+        # Find the target face.
+        # Comparing bounding boxes is not enough: the side faces of a box reach
+        # the body's max Z too, so the first "hit" is usually a vertical face.
+        # Require a near-horizontal planar face that points up (or down).
+        if face_selection not in ("top", "bottom"):
+            raise RuntimeError(f"Unknown face_selection '{face_selection}'")
+        want_up = face_selection == "top"
+
         target_face = None
-        if face_selection == "top":
-            threshold = bbox.maxPoint.z - 0.001
-            for face in body.faces:
-                if face.boundingBox.maxPoint.z > threshold:
-                    target_face = face
-                    break
-        elif face_selection == "bottom":
-            threshold = bbox.minPoint.z + 0.001
-            for face in body.faces:
-                if face.boundingBox.minPoint.z < threshold:
-                    target_face = face
-                    break
+        best_key = None
+        for face in body.faces:
+            if adsk.core.Plane.cast(face.geometry) is None:
+                continue
+            # Use the evaluator: it reports the face's outward normal, whereas
+            # the underlying plane's normal ignores the face's orientation.
+            ok, normal = face.evaluator.getNormalAtPoint(face.pointOnFace)
+            if not ok or not _hole_geom.is_horizontal_face(normal.z, want_up):
+                continue
+            # Rank on the face's own extreme Z, not on an arbitrary point on
+            # it: within the tilt tolerance the two are not the same.
+            fbox = face.boundingBox
+            edge_z = fbox.maxPoint.z if want_up else fbox.minPoint.z
+            key = _hole_geom.face_rank_key(edge_z, face.area, want_up)
+            if best_key is None or key > best_key:
+                best_key, target_face = key, face
 
         if target_face is None:
-            raise RuntimeError(f"No face found for selection '{face_selection}'")
+            raise RuntimeError(
+                f"No near-horizontal {face_selection}-facing planar face on "
+                f"'{body.name}'"
+            )
 
-        # Create a sketch point for the hole center
+        # Place the hole centre. center_x / center_y are model-space XY, so the
+        # caller does not have to know the sketch's own coordinate system. Solve
+        # the face's plane for Z rather than reusing an arbitrary point on it.
+        plane = adsk.core.Plane.cast(target_face.geometry)
+        n, o = plane.normal, plane.origin
+        center_z = _hole_geom.plane_z_at(
+            (n.x, n.y, n.z), (o.x, o.y, o.z), center_x, center_y
+        )
         sketch = root.sketches.add(target_face)
-        center = adsk.core.Point3D.create(center_x, center_y, 0)
-        sketch_pt = sketch.sketchPoints.add(center)
+        sketch_pt = sketch.sketchPoints.add(
+            sketch.modelToSketchSpace(
+                adsk.core.Point3D.create(center_x, center_y, center_z)
+            )
+        )
 
-        # Create hole feature
+        # createSimpleInput() takes the DIAMETER -- "A ValueInput object that
+        # defines the diameter of the hole" -- not the radius.
         holes = root.features.holeFeatures
         hole_input = holes.createSimpleInput(
-            adsk.core.ValueInput.createByReal(diameter / 2)
+            adsk.core.ValueInput.createByReal(diameter)
         )
         hole_input.setPositionBySketchPoint(sketch_pt)
         hole_input.setDistanceExtent(adsk.core.ValueInput.createByReal(depth))
+        # Without this the hole cuts every body it happens to intersect.
+        # The property takes a plain list, not an ObjectCollection.
+        hole_input.participantBodies = [body]
 
         feat = holes.add(hole_input)
-        return {"feature_name": feat.name, "diameter": diameter, "depth": depth}
+        return {
+            "feature_name": feat.name,
+            "diameter": diameter,
+            "depth": depth,
+            "actual_diameter": feat.holeDiameter.value,
+            "cut_bodies": [b.name for b in feat.bodies],
+            # Where the request resolved to, not a measurement of the feature.
+            "resolved_center": [center_x, center_y, center_z],
+        }
 
     def rectangular_pattern(
         self,
@@ -1839,7 +1951,18 @@ class CommandHandler:
                 f"Unknown units '{units}'. Expected one of: {sorted(unit_map)}"
             )
 
-        mesh_body = target.meshBodies.addByFile(file_path, unit_map[units])
+        try:
+            # MeshBodies.add(fullFilename, units) — the current API.
+            # Returns a MeshBodyList (a file can contain several bodies).
+            mesh_list = target.meshBodies.add(file_path, unit_map[units])
+        except AttributeError:
+            # Pre-2025 builds exposed this as addByFile returning one body.
+            mesh_list = None
+            mesh_body = target.meshBodies.addByFile(file_path, unit_map[units])
+        if mesh_list is not None:
+            if mesh_list.count == 0:
+                raise RuntimeError(f"No mesh bodies imported from {file_path}")
+            mesh_body = mesh_list.item(0)
 
         bb = mesh_body.boundingBox
         return {
@@ -1900,8 +2023,34 @@ class CommandHandler:
         """
         design = self._design()
         root = design.rootComponent
-        deleted = {"timeline": 0, "bodies": 0, "sketches": 0}
+        deleted = {
+            "timeline": 0,
+            "joints": 0,
+            "occurrences": 0,
+            "construction": 0,
+            "bodies": 0,
+            "sketches": 0,
+        }
         errors = []
+
+        def _sweep(collection, stage, counter):
+            """Delete every item of *collection*, newest-first."""
+            for i in range(collection.count - 1, -1, -1):
+                name = "?"
+                try:
+                    item = collection.item(i)
+                    name = getattr(item, "name", "?")
+                    item.deleteMe()
+                    deleted[counter] += 1
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "stage": stage,
+                            "index": i,
+                            "name": name,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
 
         # Parametric: unwind newest-first.  NOTE: TimelineObject has no
         # deleteMe() — that method lives on the *entity* it wraps.  Calling it
@@ -1916,20 +2065,39 @@ class CommandHandler:
                     entity = item.entity
                     if entity is None:
                         errors.append(
-                            {"stage": "timeline", "index": i, "name": name,
-                             "error": "timeline item exposes no entity"}
+                            {
+                                "stage": "timeline",
+                                "index": i,
+                                "name": name,
+                                "error": "timeline item exposes no entity",
+                            }
                         )
                         continue
                     entity.deleteMe()
                     deleted["timeline"] += 1
                 except Exception as exc:
                     errors.append(
-                        {"stage": "timeline", "index": i, "name": name,
-                         "error": f"{type(exc).__name__}: {exc}"}
+                        {
+                            "stage": "timeline",
+                            "index": i,
+                            "name": name,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
                     )
 
-        # Direct mode has no timeline; also catches anything the pass above
-        # could not remove.
+        # Direct mode has no timeline; the sweeps below also catch anything
+        # the timeline pass could not remove.  Joints go before occurrences
+        # because they reference them.
+        _sweep(root.rigidGroups, "rigid_group", "joints")
+        _sweep(root.asBuiltJoints, "as_built_joint", "joints")
+        _sweep(root.joints, "joint", "joints")
+        # Deleting an occurrence removes the component it references,
+        # including its bodies and sketches.
+        _sweep(root.occurrences, "occurrence", "occurrences")
+        _sweep(root.constructionPlanes, "construction_plane", "construction")
+        _sweep(root.constructionAxes, "construction_axis", "construction")
+        _sweep(root.constructionPoints, "construction_point", "construction")
+
         for i in range(root.bRepBodies.count - 1, -1, -1):
             name = "?"
             try:
@@ -1939,8 +2107,12 @@ class CommandHandler:
                 deleted["bodies"] += 1
             except Exception as exc:
                 errors.append(
-                    {"stage": "body", "index": i, "name": name,
-                     "error": f"{type(exc).__name__}: {exc}"}
+                    {
+                        "stage": "body",
+                        "index": i,
+                        "name": name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                 )
 
         for i in range(root.sketches.count - 1, -1, -1):
@@ -1952,17 +2124,30 @@ class CommandHandler:
                 deleted["sketches"] += 1
             except Exception as exc:
                 errors.append(
-                    {"stage": "sketch", "index": i, "name": name,
-                     "error": f"{type(exc).__name__}: {exc}"}
+                    {
+                        "stage": "sketch",
+                        "index": i,
+                        "name": name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                 )
 
         remaining = {
             "bodies": root.bRepBodies.count,
             "sketches": root.sketches.count,
+            "occurrences": root.occurrences.count,
+            "joints": (
+                root.joints.count + root.asBuiltJoints.count + root.rigidGroups.count
+            ),
+            "construction": (
+                root.constructionPlanes.count
+                + root.constructionAxes.count
+                + root.constructionPoints.count
+            ),
             "timeline": tl.count if tl is not None else 0,
         }
 
-        if remaining["bodies"] or remaining["sketches"]:
+        if any(v for k, v in remaining.items() if k != "timeline"):
             raise RuntimeError(
                 f"delete_all did not clear the design — remaining: {remaining}. "
                 f"Deleted: {deleted}. Failures: {errors}"
@@ -1975,8 +2160,13 @@ class CommandHandler:
         type_before = design.designType
 
         cmd_def = self.ui.commandDefinitions.itemById("UndoCommand")
-        if cmd_def:
-            cmd_def.execute()
+        if cmd_def is None:
+            raise RuntimeError(
+                "Undo command is not available in the current workspace. "
+                "The design was NOT modified — delete the failed feature "
+                "explicitly instead."
+            )
+        cmd_def.execute()
 
         # Check if undo silently switched design type (Parametric → Direct)
         adsk.doEvents()  # let Fusion process the undo
@@ -1987,10 +2177,11 @@ class CommandHandler:
             if redo_def:
                 redo_def.execute()
                 adsk.doEvents()
+            parametric = adsk.fusion.DesignTypes.ParametricDesignType
             raise RuntimeError(
                 f"Undo aborted: would have changed design type from "
-                f"{'Parametric' if type_before == 1 else 'Direct'} to "
-                f"{'Parametric' if type_after == 1 else 'Direct'}. "
+                f"{'Parametric' if type_before == parametric else 'Direct'} to "
+                f"{'Parametric' if type_after == parametric else 'Direct'}. "
                 f"The undo was automatically reversed (redo). "
                 f"Delete the failed feature explicitly instead."
             )
@@ -2295,6 +2486,64 @@ class CommandHandler:
         axis_obj = axes.add(inp)
         return {"created": True, "name": axis_obj.name, "method": method}
 
+    def create_ucs(
+        self,
+        name: str = None,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        angle_x: float = 0,
+        angle_y: float = 0,
+        angle_z: float = 0,
+    ):
+        """Create a User Coordinate System at (x, y, z), angles in degrees.
+
+        The UCS API (May 2026, preview) is entity-based: the anchor must be
+        a sketch point / vertex / construction point.  This creates a hidden
+        reference sketch (``UCS_<name>_ref``) holding the anchor point; the
+        UCS stays parametrically linked to it, so don't delete that sketch.
+        (ConstructionPoint anchors are rejected by current builds, hence the
+        sketch-point route.)
+        """
+        root = self._root()
+
+        if z:
+            plane_in = root.constructionPlanes.createInput()
+            plane_in.setByOffset(
+                root.xYConstructionPlane, adsk.core.ValueInput.createByReal(z)
+            )
+            base_plane = root.constructionPlanes.add(plane_in)
+        else:
+            base_plane = root.xYConstructionPlane
+
+        sk = root.sketches.add(base_plane)
+        pt = sk.sketchPoints.add(adsk.core.Point3D.create(x, y, 0))
+        ref_name = f"UCS_{name or 'unnamed'}_ref"
+        sk.name = ref_name
+        sk.isVisible = False
+
+        geom = adsk.fusion.UserCoordinateSystemGeometry_createByPoint(pt)
+        inp = root.userCoordinateSystems.createInput(geom)
+        if angle_x:
+            inp.angleX = adsk.core.ValueInput.createByReal(math.radians(angle_x))
+        if angle_y:
+            inp.angleY = adsk.core.ValueInput.createByReal(math.radians(angle_y))
+        if angle_z:
+            inp.angleZ = adsk.core.ValueInput.createByReal(math.radians(angle_z))
+
+        ucs = root.userCoordinateSystems.add(inp)
+        if name:
+            try:
+                ucs.name = name
+            except Exception:
+                pass
+        return {
+            "name": ucs.name,
+            "origin": [x, y, z],
+            "angles_deg": [angle_x, angle_y, angle_z],
+            "reference_sketch": ref_name,
+        }
+
     # ------------------------------------------------------------------
     # Assembly
     # ------------------------------------------------------------------
@@ -2510,6 +2759,54 @@ class CommandHandler:
 
         return {"interferences": results, "count": len(results)}
 
+    def compare_meshes(self, mesh_name_a: str, mesh_name_b: str):
+        """Compare two mesh bodies; report per-node deviation statistics.
+
+        Uses PolygonMesh.compareWith (Fusion 2026): for every node in mesh A,
+        the signed distance to the closest point on mesh B (cm).  Positive
+        means the node lies on the surface-normal side of B.
+        """
+        design = self._design()
+        root = design.rootComponent
+
+        def _mesh_body_by_name(name):
+            for i in range(root.meshBodies.count):
+                mb = root.meshBodies.item(i)
+                if mb.name == name:
+                    return mb
+            raise RuntimeError(
+                f"Mesh body '{name}' not found in root component. "
+                "Use get_scene_info to list mesh bodies."
+            )
+
+        body_a = _mesh_body_by_name(mesh_name_a)
+        body_b = _mesh_body_by_name(mesh_name_b)
+
+        mesh_a = body_a.mesh or body_a.displayMesh
+        mesh_b = body_b.mesh or body_b.displayMesh
+        if mesh_a is None or mesh_b is None:
+            raise RuntimeError("Could not obtain polygon mesh data")
+
+        deviations = list(mesh_a.compareWith(mesh_b))
+        if not deviations:
+            raise RuntimeError("compareWith returned no deviation data")
+
+        abs_dev = [abs(d) for d in deviations]
+        n = len(deviations)
+        mean_abs = sum(abs_dev) / n
+        rms = math.sqrt(sum(d * d for d in deviations) / n)
+        return {
+            "mesh_a": mesh_name_a,
+            "mesh_b": mesh_name_b,
+            "node_count": n,
+            "min_deviation": min(deviations),
+            "max_deviation": max(deviations),
+            "mean_abs_deviation": mean_abs,
+            "rms_deviation": rms,
+            "max_abs_deviation": max(abs_dev),
+            "units": "cm",
+        }
+
     # ------------------------------------------------------------------
     # Appearance
     # ------------------------------------------------------------------
@@ -2547,18 +2844,66 @@ class CommandHandler:
         if not appearance:
             raise RuntimeError(f"Appearance '{appearance_name}' not found")
 
+        # Library appearances must be copied into the design before
+        # assignment — assigning a library appearance directly is
+        # version-dependent and known to fail on recent Fusion builds.
+        design = self._design()
+        local = design.appearances.itemByName(appearance.name)
+        if local is None:
+            local = design.appearances.addByCopy(appearance, appearance.name)
+        if local is None:
+            raise RuntimeError(
+                f"Could not copy appearance '{appearance_name}' into the design"
+            )
+
         if target_type == "body":
             body = self._body_by_name(target_name)
-            body.appearance = appearance
+            body.appearance = local
         elif target_type == "component":
             comp = self._component_by_name(target_name)
-            comp.appearance = appearance
+            comp.appearance = local
         elif target_type == "face":
             body = self._body_by_name(target_name)
             face = body.faces.item(face_index)
-            face.appearance = appearance
+            face.appearance = local
 
         return {"applied": True, "target": target_name, "appearance": appearance_name}
+
+    def set_color(
+        self,
+        body_name: str,
+        red: int,
+        green: int,
+        blue: int,
+        opacity: float = 1.0,
+    ):
+        """Assign a flat RGB color to a body via a design-local appearance.
+
+        Uses the Appearances.add + Appearance.color API (July 2026), so no
+        library copy is needed.  Appearances are reused when the same color
+        is requested again.  opacity 1.0 = fully opaque, 0.0 = invisible.
+        """
+        body = self._body_by_name(body_name)
+        design = self._design()
+
+        red = max(0, min(255, int(red)))
+        green = max(0, min(255, int(green)))
+        blue = max(0, min(255, int(blue)))
+        alpha = max(0, min(255, round(opacity * 255)))
+
+        color_name = f"MCP_{red}_{green}_{blue}_{alpha}"
+        appearance = design.appearances.itemByName(color_name)
+        if appearance is None:
+            appearance = design.appearances.add(color_name)
+            appearance.color = adsk.core.Color.create(red, green, blue, alpha)
+
+        body.appearance = appearance
+        return {
+            "body": body_name,
+            "color": [red, green, blue],
+            "opacity": alpha / 255.0,
+            "appearance": color_name,
+        }
 
     # ------------------------------------------------------------------
     # Parameters
@@ -2582,16 +2927,41 @@ class CommandHandler:
     def create_parameter(self, name: str, value: float, unit: str, comment: str = None):
         design = self._design()
         params = design.userParameters
-        params.add(name, adsk.core.ValueInput.createByReal(value), unit, comment or "")
-        return {"created": True, "name": name, "value": value, "unit": unit}
+        unit = _param_units.normalise_unit(unit)
+        # createByReal() is read in internal units (cm, radians), so a caller
+        # asking for 1000 mm would get 1000 cm labelled "mm".
+        value_input = _param_units.build_value_input(
+            value,
+            unit,
+            adsk.core.ValueInput.createByString,
+            adsk.core.ValueInput.createByReal,
+        )
+        param = params.add(name, value_input, unit, comment or "")
+        return {
+            "created": True,
+            "name": name,
+            "value": value,
+            "unit": unit,
+            "expression": param.expression,
+        }
 
     def set_parameter(self, name: str, value: float):
         design = self._design()
         param = design.userParameters.itemByName(name)
         if not param:
             raise RuntimeError(f"Parameter '{name}' not found")
-        param.value = value
-        return {"updated": True, "name": name, "value": value}
+        # Assigning .value would be read in internal units, silently rescaling
+        # any parameter whose unit is not the internal one. Write the
+        # expression, in the unit the parameter already declares.
+        unit = _param_units.normalise_unit(param.unit)
+        param.expression = _param_units.expression_for(value, unit)
+        return {
+            "updated": True,
+            "name": name,
+            "value": value,
+            "unit": unit,
+            "expression": param.expression,
+        }
 
     def delete_parameter(self, name: str):
         design = self._design()
@@ -2788,10 +3158,33 @@ class CommandHandler:
     # ------------------------------------------------------------------
 
     def _get_cam(self):
-        """Get the CAM product from the active document."""
+        """Get the CAM product from the active document.
+
+        On recent Fusion builds the CAM product is only instantiated once
+        the Manufacture workspace has been activated for the document, so
+        activate it on demand instead of failing outright.  Note:
+        itemByProductType *raises* when the product doesn't exist yet.
+        """
         doc = self.app.activeDocument
-        cam_product = doc.products.itemByProductType("CAMProductType")
-        if not cam_product:
+
+        def _find_cam_product():
+            try:
+                return doc.products.itemByProductType("CAMProductType")
+            except Exception:
+                return None
+
+        cam_product = _find_cam_product()
+        if cam_product is None:
+            ws = self.ui.workspaces.itemById("CAMEnvironment")
+            if ws is not None:
+                try:
+                    ws.activate()
+                    adsk.doEvents()
+                except Exception as exc:
+                    log.warning("Manufacture workspace activation failed: %s", exc)
+                cam_product = _find_cam_product()
+
+        if cam_product is None:
             raise RuntimeError(
                 "No CAM workspace found. Open the Manufacturing workspace "
                 "in Fusion 360 at least once to initialise it."
@@ -2903,7 +3296,71 @@ class CommandHandler:
             setup_input.name = name
 
         setup = cam.setups.add(setup_input)
-        return {"name": setup.name, "body": body_name, "operation_type": operation_type}
+
+        # Stock parameters live on the created setup, not the input.
+        # Names/enumeration values verified against Fusion 2705: the
+        # "Relative size box" UI choice has the id 'default'.
+        stock_mode_map = {
+            "relative_box": "default",
+            "fixed_box": "fixedbox",
+            "relative_cylinder": "relativecylinder",
+            "fixed_cylinder": "fixedcylinder",
+            "from_solid": "solid",
+        }
+        applied_stock = {}
+        failed_stock = {}
+        if stock_mode:
+            mode_id = stock_mode_map.get(stock_mode, stock_mode)
+            if self._set_cam_parameter(setup, "job_stockMode", mode_id, by_string=True):
+                applied_stock["stock_mode"] = mode_id
+            else:
+                failed_stock["stock_mode"] = stock_mode
+        for param_name, value in (
+            ("job_stockOffset", stock_offset_sides),
+            ("job_stockOffsetTop", stock_offset_top),
+            ("job_stockOffsetBottom", stock_offset_bottom),
+        ):
+            if value:
+                if self._set_cam_parameter(setup, param_name, value):
+                    applied_stock[param_name] = value
+                else:
+                    failed_stock[param_name] = value
+
+        result = {
+            "name": setup.name,
+            "body": body_name,
+            "operation_type": operation_type,
+        }
+        if applied_stock:
+            result["stock_applied"] = applied_stock
+        if failed_stock:
+            result["stock_failed"] = failed_stock
+            result["warning"] = (
+                "Some stock parameters could not be applied — parameter "
+                "names vary by Fusion build; inspect via cam_get_operation_info"
+            )
+        return result
+
+    @staticmethod
+    def _set_cam_parameter(target, param_name, value, by_string=False):
+        """Set a CAM parameter on a setup or operation. Returns success.
+
+        CAMParameter.value is read-only on current Fusion builds — values
+        must be assigned via the ``expression`` property.  Enum parameters
+        (e.g. tool_coolant) take quoted lowercase strings ('flood').
+        """
+        try:
+            params = getattr(target, "parameters", None)
+            if params is None:
+                return False
+            p = params.itemByName(param_name)
+            if p is None:
+                return False
+            p.expression = f"'{value}'" if by_string else str(value)
+            return True
+        except Exception as exc:
+            log.debug("CAM parameter %s=%r failed: %s", param_name, value, exc)
+            return False
 
     def cam_create_operation(
         self,
@@ -2921,18 +3378,71 @@ class CommandHandler:
         cam = self._get_cam()
         setup = self._find_setup(cam, setup_name)
 
+        if tool_diameter is not None:
+            raise RuntimeError(
+                "tool_diameter cannot be set on an operation — tool geometry "
+                "comes from a tool in the CAM tool library. Select the tool "
+                "via tool_number instead."
+            )
+
         op_input = setup.operations.createInput(strategy)
         if name:
             op_input.name = name
-        if tool_diameter:
-            op_input.toolDiameter = adsk.core.ValueInput.createByReal(tool_diameter)
-        if stepdown:
-            op_input.maximumStepdown = adsk.core.ValueInput.createByReal(stepdown)
-        if stepover:
-            op_input.maximumStepover = adsk.core.ValueInput.createByReal(stepover)
 
         op = setup.operations.add(op_input)
-        return {"name": op.name, "setup": setup_name, "strategy": strategy}
+        if op is None:
+            raise RuntimeError(
+                f"Fusion rejected strategy '{strategy}' for setup '{setup_name}'"
+            )
+
+        # Operation parameters (stepdown, feeds, speeds...) only exist on
+        # the created operation, keyed by strategy-dependent names.
+        applied = {}
+        failed = {}
+        for param_name, value, by_string in (
+            ("tool_number", tool_number, False),
+            ("maximumStepdown", stepdown, False),
+            ("maximumStepover", stepover, False),
+            ("tool_feedCutting", feed_rate, False),
+            ("tool_spindleSpeed", spindle_speed, False),
+            ("tool_coolant", coolant, True),
+        ):
+            if value is None:
+                continue
+            if self._set_cam_parameter(op, param_name, value, by_string):
+                applied[param_name] = value
+            else:
+                failed[param_name] = value
+
+        result = {"name": op.name, "setup": setup_name, "strategy": strategy}
+        if applied:
+            result["parameters_applied"] = applied
+        if failed:
+            result["parameters_failed"] = failed
+            result["warning"] = (
+                "Some parameters are not available for this strategy — "
+                "check available names via cam_get_operation_info"
+            )
+        return result
+
+    @staticmethod
+    def _wait_future(future, timeout: float = 25.0):
+        """Wait for a CAM generation future, bounded so a runaway
+        generation fails as a structured error instead of freezing the
+        main thread past the bridge timeout."""
+        is_completed = getattr(future, "isCompleted", None)
+        if is_completed is None:
+            future.wait()
+            return
+        deadline = time.monotonic() + timeout
+        while not future.isCompleted:
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Toolpath generation did not finish within {timeout}s. "
+                    "The operation may still complete in the background — "
+                    "check with cam_list_operations before regenerating."
+                )
+            time.sleep(0.1)
 
     def cam_generate_toolpath(
         self,
@@ -2944,14 +3454,14 @@ class CommandHandler:
 
         if generate_all:
             future = cam.generateAllToolpaths(False)
-            future.wait()
+            self._wait_future(future)
             return {"generated": True, "scope": "all"}
 
         if operation_name and setup_name:
             setup = self._find_setup(cam, setup_name)
             op = self._find_operation(setup, operation_name)
             future = cam.generateToolpath(op)
-            future.wait()
+            self._wait_future(future)
             return {
                 "generated": True,
                 "scope": "operation",
@@ -2964,7 +3474,7 @@ class CommandHandler:
             for i in range(setup.operations.count):
                 ops.add(setup.operations.item(i))
             future = cam.generateToolpath(ops)
-            future.wait()
+            self._wait_future(future)
             return {"generated": True, "scope": "setup", "setup": setup_name}
 
         raise RuntimeError("Provide setup_name, operation_name, or generate_all=true")
@@ -2983,7 +3493,23 @@ class CommandHandler:
         if not output_folder:
             output_folder = os.path.join(os.path.expanduser("~"), "Desktop")
 
-        post_config = os.path.join(cam.genericPostFolder, f"{post_processor}.cps")
+        # Accept a full path to a .cps file, or resolve a short name against
+        # the legacy local post folder when the build still provides one.
+        if post_processor.endswith(".cps") or os.path.sep in post_processor:
+            post_config = post_processor
+        else:
+            post_folder = getattr(cam, "genericPostFolder", None)
+            if not post_folder:
+                raise RuntimeError(
+                    "This Fusion build has no local generic post folder "
+                    "(posts are cloud-library based). Pass the full path to "
+                    "the .cps file in 'post_processor' instead of a short "
+                    "name."
+                )
+            post_config = os.path.join(post_folder, f"{post_processor}.cps")
+
+        if not os.path.isfile(post_config):
+            raise RuntimeError(f"Post processor not found: {post_config}")
 
         units = (
             adsk.cam.PostOutputUnitOptions.MillimetersOutput
@@ -3128,10 +3654,11 @@ class CommandHandler:
             type_after = type_before
             log.debug("design handle stale after execute_code: %s", exc)
         if type_before != type_after:
+            parametric = adsk.fusion.DesignTypes.ParametricDesignType
             design_type_warning = (
                 f"WARNING: Design type changed from "
-                f"{'parametric' if type_before == 1 else 'direct'} to "
-                f"{'parametric' if type_after == 1 else 'direct'} "
+                f"{'parametric' if type_before == parametric else 'direct'} to "
+                f"{'parametric' if type_after == parametric else 'direct'} "
                 f"during code execution. Use set_design_type to recover."
             )
             log.warning(design_type_warning)
@@ -3206,8 +3733,16 @@ class CommandHandler:
             mass_g = 0.0
             if body_count > 0:
                 try:
-                    # physicalProperties.mass is in kg
-                    mass_g = float(root.physicalProperties.mass) * 1000.0
+                    # physicalProperties.mass is in kg.  Sum occurrence
+                    # bodies explicitly so mass_g stays consistent with
+                    # body_count (which includes occurrence bodies).
+                    mass_kg = float(root.physicalProperties.mass)
+                    for occ in root.allOccurrences:
+                        try:
+                            mass_kg += float(occ.physicalProperties.mass)
+                        except Exception:
+                            pass
+                    mass_g = mass_kg * 1000.0
                 except Exception:
                     mass_g = 0.0
 
@@ -3260,6 +3795,11 @@ class CommandHandler:
         if viewport is None:
             raise RuntimeError("No active viewport")
 
+        # Clamp dimensions — an oversized capture would stall the main
+        # thread and produce an enormous base64 payload.
+        width = max(16, min(int(width), 4096))
+        height = max(16, min(int(height), 4096))
+
         repositioned = view != "current"
         if repositioned:
             spec = self._VIEW_DIRS.get(view)
@@ -3307,11 +3847,15 @@ class CommandHandler:
                 cam.target = adsk.core.Point3D.create(*orig_state["target"])
                 cam.upVector = adsk.core.Vector3D.create(*orig_state["up"])
                 viewport.camera = cam
+                try:
+                    viewport.refresh()
+                except Exception:
+                    pass
 
         return {
             "view": view,
-            "width": int(width),
-            "height": int(height),
+            "width": width,
+            "height": height,
             "image_format": "png",
             "image_base64": base64.b64encode(data).decode("ascii"),
             "bytes": len(data),

@@ -113,10 +113,12 @@ def test_expected_tools_present():
         "delete_parameter",
         # sketch constraints & dimensions
         "add_constraint",
+        "auto_constrain",
         "add_dimension",
         # construction geometry
         "create_construction_plane",
         "create_construction_axis",
+        "create_ucs",
         # splines
         "draw_spline",
         # sketch curve operations
@@ -145,8 +147,10 @@ def test_expected_tools_present():
         "get_physical_properties",
         "create_section_analysis",
         "check_interference",
+        "compare_meshes",
         # appearance
         "set_appearance",
+        "set_color",
         # project geometry
         "project_geometry",
         # timeline control
@@ -280,3 +284,4 @@ def test_get_tool_by_name_edge_cases():
     assert get_tool_by_name("") is None
     assert get_tool_by_name("PING") is None  # case sensitive
     assert get_tool_by_name("ping ") is None  # trailing space
+

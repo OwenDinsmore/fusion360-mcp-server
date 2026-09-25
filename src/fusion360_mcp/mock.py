@@ -62,6 +62,9 @@ _MUTATION_MOCKS: frozenset[str] = frozenset(
         "fusion_rebuild",
         "fusion_reset",
         "fusion_execute",
+        "auto_constrain",
+        "create_ucs",
+        "set_color",
     }
 )
 
@@ -306,10 +309,16 @@ def _draw_arc(p: dict) -> dict:
 
 
 def _create_hole(p: dict) -> dict:
+    body = p.get("body_name") or f"Body{p.get('body_index', 0) + 1}"
+    diameter = p.get("diameter", 0.5)
     return {
-        "body_name": p.get("body_name", "Body1"),
-        "diameter": p.get("diameter", 0.5),
+        "feature_name": "Hole_mock",
+        "body_name": body,
+        "diameter": diameter,
         "depth": p.get("depth", 1),
+        "actual_diameter": diameter,
+        "cut_bodies": [body],
+        "resolved_center": [p.get("center_x", 0), p.get("center_y", 0), 0.0],
     }
 
 
@@ -451,16 +460,32 @@ def _get_parameters(_p: dict) -> dict:
 
 
 def _create_parameter(p: dict) -> dict:
+    value = p.get("value", 0)
+    # The addon trims the unit and treats blank as unitless; mirror both so
+    # mock and real modes agree. "unit" is required by the schema, so the
+    # default only covers a caller that omitted it entirely.
+    unit = ("mm" if p.get("unit") is None else p["unit"]).strip()
     return {
+        "created": True,
         "name": p.get("name", "param1"),
-        "value": p.get("value", 0),
-        "unit": p.get("unit", "mm"),
+        "value": value,
+        "unit": unit,
+        "expression": f"{value} {unit}" if unit else f"{value}",
         "comment": p.get("comment", ""),
     }
 
 
 def _set_parameter(p: dict) -> dict:
-    return {"name": p.get("name", "param1"), "value": p.get("value", 0)}
+    # The real handler reports the unit the target parameter already declares
+    # and the expression Fusion stored. Mock mode holds no design, so it
+    # cannot know either -- report null rather than invent "mm".
+    return {
+        "updated": True,
+        "name": p.get("name", "param1"),
+        "value": p.get("value", 0),
+        "unit": None,
+        "expression": None,
+    }
 
 
 def _delete_parameter(p: dict) -> dict:
@@ -476,6 +501,17 @@ def _add_constraint(p: dict) -> dict:
         "entity_one": p.get("entity_one", 0),
         "entity_two": p.get("entity_two", 1),
         "sketch_name": p.get("sketch_name", "Sketch1"),
+    }
+
+
+def _auto_constrain(p: dict) -> dict:
+    return {
+        "sketch": p.get("sketch_name", "Sketch1"),
+        "is_fully_constrained": True,
+        "constraints_added": 4,
+        "dimensions_added": 2,
+        "entities_moved": 0,
+        "result_option": p.get("result_option", 1),
     }
 
 
@@ -690,6 +726,45 @@ def _check_interference(p: dict) -> dict:
         "component_names": p.get("component_names", []),
         "interference_count": 0,
         "interferences": [],
+    }
+
+
+def _compare_meshes(p: dict) -> dict:
+    return {
+        "mesh_a": p.get("mesh_name_a", "Mesh1"),
+        "mesh_b": p.get("mesh_name_b", "Mesh2"),
+        "node_count": 1200,
+        "min_deviation": -0.004,
+        "max_deviation": 0.006,
+        "mean_abs_deviation": 0.001,
+        "rms_deviation": 0.0015,
+        "max_abs_deviation": 0.006,
+        "units": "cm",
+    }
+
+
+def _create_ucs(p: dict) -> dict:
+    name = p.get("name", "UCS1")
+    return {
+        "name": name,
+        "origin": [p.get("x", 0), p.get("y", 0), p.get("z", 0)],
+        "angles_deg": [
+            p.get("angle_x", 0),
+            p.get("angle_y", 0),
+            p.get("angle_z", 0),
+        ],
+        "reference_sketch": f"UCS_{name}_ref",
+    }
+
+
+def _set_color(p: dict) -> dict:
+    r, g, b = p.get("red", 255), p.get("green", 0), p.get("blue", 0)
+    alpha = round(p.get("opacity", 1.0) * 255)
+    return {
+        "body": p.get("body_name", "Body1"),
+        "color": [r, g, b],
+        "opacity": p.get("opacity", 1.0),
+        "appearance": f"MCP_{r}_{g}_{b}_{alpha}",
     }
 
 
@@ -1351,6 +1426,7 @@ _DISPATCH: dict[str, Any] = {
     "delete_parameter": _delete_parameter,
     # sketch constraints & dimensions
     "add_constraint": _add_constraint,
+    "auto_constrain": _auto_constrain,
     "add_dimension": _add_dimension,
     # construction geometry
     "create_construction_plane": _create_construction_plane,
@@ -1382,6 +1458,9 @@ _DISPATCH: dict[str, Any] = {
     "get_physical_properties": _get_physical_properties,
     "create_section_analysis": _create_section_analysis,
     "check_interference": _check_interference,
+    "compare_meshes": _compare_meshes,
+    "create_ucs": _create_ucs,
+    "set_color": _set_color,
     # appearance
     "set_appearance": _set_appearance,
     # project geometry
