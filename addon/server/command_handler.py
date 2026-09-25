@@ -4154,17 +4154,36 @@ class CommandHandler:
             # it throws away the real thing: the next `import adsk.fusion`
             # builds a bare package and fails with "no attribute 'fusion'".
             # So a namespace package is ours only if EVERY portion is.
-            entries = [str(e) for e in (getattr(mod, "__path__", None) or [])]
+            raw = getattr(mod, "__path__", None)
+            try:
+                entries = [str(e) for e in (raw or [])]
+            except Exception:
+                # An ORPHAN: a nested namespace package whose parent is no
+                # longer in sys.modules cannot recompute its __path__ (the
+                # recompute reads the parent's and raises KeyError). Judge it
+                # by the last path it computed — otherwise it is never
+                # evicted and serves a stale submodule on every rebuild.
+                entries = [str(e) for e in (getattr(raw, "_path", None) or [])]
             return bool(entries) and all(_in_tree(e) for e in entries)
 
-        evicted = []
+        # Decide EVERY module before deleting ANY. A nested namespace package
+        # (cad/products/<product>/, imported as products.<product>.<module>)
+        # recomputes its __path__ through its parent; delete "products" first
+        # and reading "products.card_vault".__path__ raises, the except below
+        # skipped it, and the surviving package object kept serving the
+        # PREVIOUS build's submodule — bound to the previous fusionlib, so its
+        # checks and trace went nowhere.
+        doomed = []
         for mod_name, mod in list(sys.modules.items()):
             try:
                 if _under_script_tree(mod_name, mod):
-                    del sys.modules[mod_name]
-                    evicted.append(mod_name)
+                    doomed.append(mod_name)
             except Exception:
                 continue
+        evicted = []
+        for mod_name in doomed:
+            if sys.modules.pop(mod_name, None) is not None:
+                evicted.append(mod_name)
 
         buf = io.StringIO()
         t0 = time.monotonic()
