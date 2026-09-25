@@ -4101,6 +4101,18 @@ class CommandHandler:
         # `from lib import fusionlib` without any packaging ceremony.
         script_dir = os.path.dirname(path)
         roots = [c for c in (script_dir, os.path.dirname(script_dir)) if c]
+        # AND THE CAD ROOT, however deep the script is: the nearest ancestor
+        # holding lib/fusionlib.py. A design two levels down — cad/products/
+        # <product>/x.py — otherwise cannot `from lib import fusionlib` at
+        # all, and worse, lib/ and parts/ are not under the evicted tree, so
+        # they would be served stale from sys.modules on every later rebuild.
+        probe = script_dir
+        while probe and probe != os.path.dirname(probe):
+            if os.path.isfile(os.path.join(probe, "lib", "fusionlib.py")):
+                if probe not in roots:
+                    roots.append(probe)
+                break
+            probe = os.path.dirname(probe)
         added_paths = []
         for candidate in roots:
             if candidate not in sys.path:
